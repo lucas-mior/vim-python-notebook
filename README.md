@@ -295,8 +295,7 @@ let g:python_notebook_draw_engine = 'chafa'
 let g:python_notebook_draw_engine = 'magick'
 let g:python_notebook_draw_engine = 'ueberzugpp'
 " Terminal cell pixel size
-" (fallback in case your terminal does not respond to
-the escape sequences)
+" (fallback in case your terminal does not respond to the escape sequences)
 let g:python_notebook_cell_width = 10
 let g:python_notebook_cell_height = 20
 
