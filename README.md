@@ -1,4 +1,4 @@
-# notebook-python.vim
+# vim-python-notebook.vim
 
 A small Jupyter-like Python notebook runner for Vim. It lets you split a normal
 `.py` file into cells with `# %%`, run cells through a persistent stateful
