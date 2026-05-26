@@ -62,9 +62,10 @@ For figure sizing / image preparation:
 
 For terminal image drawing, depending on `g:python_notebook_draw_engine`:
 
-- `chafa` for the default `chafa` engine.
-- ImageMagick's `magick` command for the `magick` engine.
-- `ueberzugpp` for the `ueberzugpp` engine.
+- For sixel, you need a terminal that supports it and one of:
+  * chafa
+  * ImageMagick
+- For ueberzugpp, you need to have ueberzugpp installed.
 
 Your Python notebook code may also require whatever packages it imports, such as
 `numpy`, `pandas`, or `scipy`.
