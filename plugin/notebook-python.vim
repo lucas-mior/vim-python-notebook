@@ -1,0 +1,4325 @@
+vim9script
+
+# notebook-python.vim
+# Build: async stateful kernel cells with optional timings 2026-05-25
+# Minimal Jupyter-like Python notebook runner for Vim.
+#
+# Install:
+#
+#    ~/.vim/plugin/notebook-python.vim
+#    ~/.vim/plugin/notebook-python-draw.py
+#
+# Activation:
+#
+#    The plugin is globally loaded by Vim, but notebook behavior only activates
+#    for Python buffers containing one of these comments near the top:
+#
+#        # notebook-python: enable
+#        # nb: enable
+#
+# Cell syntax:
+#
+#    # %%
+#    x = 10
+#    x + 5
+#
+# Generated output:
+#
+#    # nb-output: start [stdout, result, figure]
+#    # stdout text
+#    # result text
+#    # nb-figure: cell_0007_fig_0001.png
+#    #
+#    #
+#    # nb-output: end
+#
+# Generated errors:
+#
+#    # nb-error: start
+#    # traceback text
+#    # nb-error: end
+#
+# Generated running status:
+#
+#    # nb-status: start [running]
+#    # running...
+#    # nb-status: end
+#
+# Commands:
+#
+#    :PythonNotebookTryEnable
+#    :PythonNotebookRunAll
+#    :PythonNotebookRunCell
+#    :PythonNotebookRestartKernel
+#    :PythonNotebookClearOutputs
+#    :PythonNotebookDrawFigures
+#
+# Mappings:
+#
+#    This plugin defines commands only. Add mappings in your vimrc if desired.
+
+if exists('g:loaded_python_notebook_vim')
+    finish
+endif
+g:loaded_python_notebook_vim = 1
+
+var script_sid: string = expand('<SID>')
+var script_dir: string = expand('<sfile>:p:h')
+
+if !exists('g:python_notebook_helper')
+    g:python_notebook_helper = script_dir .. '/notebook-python-draw.py'
+endif
+
+if !exists('g:python_notebook_cache_dir')
+    if exists('$XDG_CACHE_HOME') && !empty($XDG_CACHE_HOME)
+        g:python_notebook_cache_dir = $XDG_CACHE_HOME .. '/notebook-python-vim'
+    else
+        g:python_notebook_cache_dir = expand('~/.cache/notebook-python-vim')
+    endif
+endif
+
+if !exists('g:python_notebook_stop_on_error')
+    g:python_notebook_stop_on_error = 1
+endif
+
+# Maximum time to wait for a stateful kernel response. The old run-all path
+# waited for the helper process to finish; this gives the channel-based kernel
+# a similarly generous default while still allowing recovery from a wedged job.
+if !exists('g:python_notebook_kernel_timeout_ms')
+    g:python_notebook_kernel_timeout_ms = 300000
+endif
+
+if !exists('g:python_notebook_annotation_scan_lines')
+    g:python_notebook_annotation_scan_lines = 120
+endif
+
+if !exists('g:python_notebook_figure_lines')
+    g:python_notebook_figure_lines = 40
+endif
+
+# Image engine options:
+#
+#    let g:python_notebook_draw_engine = 'chafa'
+#    let g:python_notebook_draw_engine = 'magick'
+#    let g:python_notebook_draw_engine = 'ueberzugpp'
+if !exists('g:python_notebook_draw_engine')
+    g:python_notebook_draw_engine = 'chafa'
+endif
+
+# Image renderers ultimately need pixel dimensions. These defaults
+# approximate one terminal cell in pixels; tune them if rendered figures
+# are too large, too small, or distorted for your terminal/font.
+if !exists('g:python_notebook_cell_width')
+    g:python_notebook_cell_width = 10
+endif
+
+if !exists('g:python_notebook_cell_height')
+    g:python_notebook_cell_height = 20
+endif
+
+# ueberzugpp runs as a layer daemon. The plugin starts it on VimEnter when
+# g:python_notebook_draw_engine is set to 'ueberzugpp'. Leave output empty to
+# let ueberzugpp choose from its config/environment, or set it to one of its
+# supported outputs such as 'x11', 'wayland', 'sixel', 'kitty', or 'chafa'.
+
+if !exists('g:python_notebook_ueberzugpp_output')
+    g:python_notebook_ueberzugpp_output = 'x11'
+endif
+
+# With --use-escape-codes, ueberzugpp may need stdout connected to the real
+# terminal. Keep this enabled by default. Set it to 0 if you specifically want
+# to capture stdout while debugging startup.
+if !exists('g:python_notebook_ueberzugpp_stdout_to_tty')
+    g:python_notebook_ueberzugpp_stdout_to_tty = 0
+endif
+
+if !exists('g:python_notebook_image_prep_worker_timeout_ms')
+    g:python_notebook_image_prep_worker_timeout_ms = 2000
+endif
+
+if !exists('g:python_notebook_image_prep_worker_cache_size')
+    g:python_notebook_image_prep_worker_cache_size = 16
+endif
+
+if !exists('g:python_notebook_show_cell_timings')
+    g:python_notebook_show_cell_timings = 1
+endif
+
+var output_start_marker_prefix: string = '# nb-output: start'
+var output_end_marker: string = '# nb-output: end'
+var error_start_marker: string = '# nb-error: start'
+var error_end_marker: string = '# nb-error: end'
+var status_start_marker_prefix: string = '# nb-status: start'
+var status_end_marker: string = '# nb-status: end'
+var figure_marker_prefix: string = '# nb-figure: '
+
+var figure_sixel_cache: dict<string> = {}
+var figure_draw_timer: number = -1
+var notebook_layout_redraw_timer: number = -1
+var notebook_layout_signature: string = ''
+
+var ueberzugpp_job: any = v:none
+var ueberzugpp_channel: any = v:none
+var ueberzugpp_pid: number = 0
+var ueberzugpp_visible_image_ids: dict<bool> = {}
+var ueberzugpp_current_cycle_ids: dict<bool> = {}
+var ueberzugpp_prepared_cache: dict<string> = {}
+var ueberzugpp_error: string = ''
+var ueberzugpp_last_command: string = ''
+var ueberzugpp_last_stdout: string = ''
+var ueberzugpp_last_stderr: string = ''
+var ueberzugpp_last_exit_status: string = ''
+
+var image_prep_worker_job: any = v:none
+var image_prep_worker_channel: any = v:none
+var image_prep_worker_pid: number = 0
+var image_prep_worker_stdout_buffer: string = ''
+var image_prep_worker_next_request_id: number = 0
+var image_prep_worker_error: string = ''
+var image_prep_worker_last_request: string = ''
+var image_prep_worker_last_response: string = ''
+var image_prep_worker_last_stderr: string = ''
+var image_prep_worker_last_exit_status: string = ''
+
+var notebook_kernel_pending_requests: dict<dict<any>> = {}
+var notebook_kernel_pending_by_bufnr: dict<string> = {}
+var notebook_kernel_ready_responses: dict<any> = {}
+var notebook_kernel_expected_exit_by_bufnr: dict<bool> = {}
+
+def GetStringSetting(name: string, default_value: string): string
+    var value: any = get(g:, name, default_value)
+
+    if type(value) == v:t_string
+        return value
+    endif
+
+    return string(value)
+enddef
+
+def GetNumberSetting(name: string, default_value: number): number
+    var value: any = get(g:, name, default_value)
+
+    if type(value) == v:t_number
+        return value
+    endif
+
+    if type(value) == v:t_string
+        return str2nr(value)
+    endif
+
+    return str2nr(string(value))
+enddef
+
+def NotebookFigureDir(): string
+    return expand('~/.cache/notebook-python-vim')
+           .. '/figures/buf_' .. bufnr('%')
+enddef
+
+def CellWidth(): number
+    var cell_width: number = GetNumberSetting(
+        'python_notebook_cell_width', 10)
+    if cell_width <= 0
+        cell_width = 10
+    endif
+
+    return cell_width
+enddef
+
+def CellHeight(): number
+    var cell_height: number = GetNumberSetting(
+        'python_notebook_cell_height', 20)
+    if cell_height <= 0
+        cell_height = 20
+    endif
+
+    return cell_height
+enddef
+
+def UeberzugppExecutable(): string
+    var command: string = 'ueberzugpp'
+    var resolved: string = exepath(command)
+    if !empty(resolved)
+        return resolved
+    endif
+
+    return command
+enddef
+
+def UeberzugppOutput(): string
+    return GetStringSetting('python_notebook_ueberzugpp_output', '')
+enddef
+
+def UeberzugppPreparedOutputFormat(): string
+    var configured_format: string = GetStringSetting(
+        'python_notebook_ueberzugpp_prepared_output_format', '')
+    if !empty(configured_format)
+        return configured_format
+    endif
+
+    # The patched ueberzugpp X11 backend uses XShape for 1-bit alpha:
+    # alpha == 0 becomes outside the child-window shape, while alpha > 0 is
+    # drawn opaquely. Feed it the same sixel-friendly PNG that chafa uses:
+    # fully transparent pixels remain transparent, and partially transparent
+    # anti-aliased pixels are pre-composited into opaque RGB.
+    if UeberzugppOutput() ==# 'x11'
+        return 'sixel'
+    endif
+
+    return 'rgba'
+enddef
+
+def UeberzugppStdoutToTty(): bool
+    return GetNumberSetting('python_notebook_ueberzugpp_stdout_to_tty', 1) != 0
+enddef
+
+def UeberzugppJobStatus(): string
+    if !exists('*job_status')
+        return 'job_status() unavailable'
+    endif
+
+    if type(ueberzugpp_job) != v:t_job
+        return 'none'
+    endif
+
+    try
+        return job_status(ueberzugpp_job)
+    catch
+        return 'error: ' .. v:exception
+    endtry
+enddef
+
+def UeberzugppChannelStatus(): string
+    if !exists('*ch_status')
+        return 'ch_status() unavailable'
+    endif
+
+    if type(ueberzugpp_channel) != v:t_channel
+        return 'none'
+    endif
+
+    try
+        return ch_status(ueberzugpp_channel)
+    catch
+        return 'error: ' .. v:exception
+    endtry
+enddef
+
+def UeberzugppStdoutCb(channel: any, message: string)
+    var clean_message: string = StripNullBytes(message)
+    if empty(clean_message)
+        return
+    endif
+
+    ueberzugpp_last_stdout = clean_message
+enddef
+
+def UeberzugppStderrCb(channel: any, message: string)
+    var clean_message: string = StripNullBytes(message)
+    if empty(clean_message)
+        return
+    endif
+
+    ueberzugpp_last_stderr = clean_message
+    ueberzugpp_error = 'stderr: ' .. clean_message
+    echohl ErrorMsg
+    echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+    echohl None
+enddef
+
+def UeberzugppExitCb(job: any, status: number)
+    ueberzugpp_last_exit_status = string(status)
+    if status != 0
+        ueberzugpp_error = 'layer process exited with status '
+                                .. string(status)
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+    endif
+
+    ueberzugpp_job = v:none
+    ueberzugpp_channel = v:none
+    ueberzugpp_pid = 0
+enddef
+
+def UeberzugppLayerReady(): bool
+    if !exists('*job_status') || !exists('*ch_status')
+        return false
+    endif
+
+    if type(ueberzugpp_job) != v:t_job || job_status(ueberzugpp_job) !=# 'run'
+        return false
+    endif
+
+    if type(ueberzugpp_channel) != v:t_channel
+        return false
+    endif
+
+    var status: string = ''
+    try
+        status = ch_status(ueberzugpp_channel)
+    catch
+        return false
+    endtry
+
+    return status ==# 'open' || status ==# 'buffered'
+enddef
+
+def ImagePrepWorkerTimeoutMs(): number
+    var timeout_ms: number = GetNumberSetting(
+        'python_notebook_image_prep_worker_timeout_ms', 2000)
+    if timeout_ms <= 0
+        timeout_ms = 2000
+    endif
+
+    return timeout_ms
+enddef
+
+def ImagePrepWorkerCacheSize(): number
+    var cache_size: number = GetNumberSetting(
+        'python_notebook_image_prep_worker_cache_size', 16)
+    if cache_size <= 0
+        cache_size = 16
+    endif
+
+    return cache_size
+enddef
+
+def ImagePrepWorkerJobStatus(): string
+    if !exists('*job_status')
+        return 'job_status() unavailable'
+    endif
+
+    if type(image_prep_worker_job) != v:t_job
+        return 'none'
+    endif
+
+    try
+        return job_status(image_prep_worker_job)
+    catch
+        return 'error: ' .. v:exception
+    endtry
+enddef
+
+def ImagePrepWorkerChannelStatus(): string
+    if !exists('*ch_status')
+        return 'ch_status() unavailable'
+    endif
+
+    if type(image_prep_worker_channel) != v:t_channel
+        return 'none'
+    endif
+
+    try
+        return ch_status(image_prep_worker_channel)
+    catch
+        return 'error: ' .. v:exception
+    endtry
+enddef
+
+def ImagePrepWorkerReady(): bool
+    if !exists('*job_status') || !exists('*ch_status')
+        return false
+    endif
+
+    if type(image_prep_worker_job) != v:t_job
+            || job_status(image_prep_worker_job) !=# 'run'
+        return false
+    endif
+
+    if type(image_prep_worker_channel) != v:t_channel
+        return false
+    endif
+
+    var status: string = ''
+    try
+        status = ch_status(image_prep_worker_channel)
+    catch
+        return false
+    endtry
+
+    return status ==# 'open' || status ==# 'buffered'
+enddef
+
+def ImagePrepWorkerStderrCb(channel: any, message: string)
+    var clean_message: string = StripNullBytes(message)
+    if empty(clean_message)
+        return
+    endif
+
+    image_prep_worker_last_stderr = clean_message
+    image_prep_worker_error = clean_message
+    ueberzugpp_error = 'image prep worker stderr: ' .. clean_message
+    echohl ErrorMsg
+    echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+    echohl None
+enddef
+
+def ImagePrepWorkerExitCb(job: any, status: number)
+    image_prep_worker_last_exit_status = string(status)
+    if status != 0
+        image_prep_worker_error = 'image prep worker exited with status '
+            .. string(status)
+        ueberzugpp_error = image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+    endif
+
+    image_prep_worker_job = v:none
+    image_prep_worker_channel = v:none
+    image_prep_worker_pid = 0
+    image_prep_worker_stdout_buffer = ''
+enddef
+
+def StartImagePrepWorker()
+    if ImagePrepWorkerReady()
+        return
+    endif
+
+    if !exists('*job_start')
+        image_prep_worker_error =
+            'job_start() is unavailable in this Vim build'
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    if !exists('*job_getchannel')
+        image_prep_worker_error =
+            'job_getchannel() is unavailable in this Vim build'
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    if !exists('*ch_sendraw') || !exists('*ch_readraw')
+        image_prep_worker_error =
+            'ch_sendraw()/ch_readraw() is unavailable in this Vim build'
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    var python_cmd: string = 'python3'
+    var helper_path: string = g:python_notebook_helper
+
+    if empty(python_cmd) || !executable(python_cmd)
+        image_prep_worker_error = 'Python executable not found: '
+            .. python_cmd
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    if empty(helper_path) || !filereadable(helper_path)
+        image_prep_worker_error = 'helper script not found: '
+            .. helper_path
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    var argv: list<string> = [python_cmd, helper_path, '--image-prep-worker']
+    var env: dict<string> = {
+        'NOTEBOOK_VIM_IMAGE_PREP_CACHE_SIZE':
+            string(ImagePrepWorkerCacheSize()),
+    }
+
+    var job_options: dict<any> = {
+        'in_io': 'pipe',
+        'out_io': 'pipe',
+        'err_io': 'pipe',
+        'in_mode': 'raw',
+        'out_mode': 'raw',
+        'err_mode': 'nl',
+        'drop': 'never',
+        'err_cb': function(script_sid .. 'ImagePrepWorkerStderrCb'),
+        'exit_cb': function(script_sid .. 'ImagePrepWorkerExitCb'),
+        'env': env,
+    }
+
+    try
+        image_prep_worker_job = job_start(argv, job_options)
+    catch
+        image_prep_worker_error = 'job_start() failed: ' .. v:exception
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        image_prep_worker_job = v:none
+        image_prep_worker_channel = v:none
+        image_prep_worker_pid = 0
+        return
+    endtry
+
+    if type(image_prep_worker_job) != v:t_job
+        image_prep_worker_error =
+            'job_start() did not return a job object; returned type='
+            .. string(type(image_prep_worker_job))
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        image_prep_worker_job = v:none
+        image_prep_worker_channel = v:none
+        image_prep_worker_pid = 0
+        return
+    endif
+
+    if ImagePrepWorkerJobStatus() !=# 'run'
+        image_prep_worker_error =
+            'worker did not start; job status=' .. ImagePrepWorkerJobStatus()
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        image_prep_worker_job = v:none
+        image_prep_worker_channel = v:none
+        image_prep_worker_pid = 0
+        return
+    endif
+
+    try
+        image_prep_worker_channel = job_getchannel(image_prep_worker_job)
+    catch
+        image_prep_worker_error = 'job_getchannel() failed: '
+            .. v:exception
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        try
+            job_stop(image_prep_worker_job, 'term')
+        catch
+        endtry
+        image_prep_worker_job = v:none
+        image_prep_worker_channel = v:none
+        image_prep_worker_pid = 0
+        return
+    endtry
+
+    try
+        var info: dict<any> = job_info(image_prep_worker_job)
+        image_prep_worker_pid = str2nr(string(get(info, 'process', 0)))
+    catch
+        image_prep_worker_pid = 0
+    endtry
+
+    if !ImagePrepWorkerReady()
+        image_prep_worker_error = 'worker channel is not ready; status='
+            .. ImagePrepWorkerJobStatus() .. ', channel status='
+            .. ImagePrepWorkerChannelStatus()
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        try
+            job_stop(image_prep_worker_job, 'term')
+        catch
+        endtry
+        image_prep_worker_job = v:none
+        image_prep_worker_channel = v:none
+        image_prep_worker_pid = 0
+        return
+    endif
+
+    image_prep_worker_stdout_buffer = ''
+enddef
+
+def ImagePrepWorkerTakeResponse(request_id: string): any
+    while true
+        var newline_index: number = stridx(
+            image_prep_worker_stdout_buffer, "\n")
+        if newline_index < 0
+            return v:none
+        endif
+
+        var line_str: string = strpart(image_prep_worker_stdout_buffer, 0,
+            newline_index)
+        image_prep_worker_stdout_buffer = strpart(
+            image_prep_worker_stdout_buffer, newline_index + 1)
+        line_str = substitute(StripNullBytes(line_str), '\r$', '', '')
+
+        if empty(line_str)
+            continue
+        endif
+
+        var decoded: any = v:none
+        try
+            decoded = json_decode(line_str)
+        catch
+            image_prep_worker_error =
+                'could not decode worker response: ' .. line_str
+            ueberzugpp_error = 'image prep worker: '
+                .. image_prep_worker_error
+            echohl ErrorMsg
+            echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+            echohl None
+            continue
+        endtry
+
+        if type(decoded) != v:t_dict
+            image_prep_worker_error =
+                'worker response was not a dict: ' .. line_str
+            ueberzugpp_error = 'image prep worker: '
+                .. image_prep_worker_error
+            echohl ErrorMsg
+            echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+            echohl None
+            continue
+        endif
+
+        var response: dict<any> = decoded
+        var response_id: string = JsonValueToString(get(response, 'id', ''))
+        if response_id ==# request_id
+            return response
+        endif
+    endwhile
+
+    return v:none
+enddef
+
+def ImagePrepWorkerReadResponse(request_id: string, timeout_ms: number): any
+    var waited_ms: number = 0
+    var slice_ms: number = 10
+
+    while waited_ms <= timeout_ms
+        var response: any = ImagePrepWorkerTakeResponse(request_id)
+        if type(response) == v:t_dict
+            return response
+        endif
+
+        var chunk: string = ''
+        try
+            chunk = ch_readraw(image_prep_worker_channel,
+                {'part': 'out', 'timeout': slice_ms})
+        catch
+            image_prep_worker_error = 'ch_readraw() failed: '
+                .. v:exception
+            ueberzugpp_error = 'image prep worker: '
+                .. image_prep_worker_error
+            echohl ErrorMsg
+            echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+            echohl None
+            return {
+                'id': request_id,
+                'ok': false,
+                'error': image_prep_worker_error
+            }
+        endtry
+
+        if !empty(chunk)
+            image_prep_worker_stdout_buffer ..= chunk
+            waited_ms = 0
+        else
+            waited_ms += slice_ms
+        endif
+    endwhile
+
+    image_prep_worker_error = 'timeout waiting for response id='
+        .. request_id .. ' after ' .. string(timeout_ms) .. ' ms'
+    ueberzugpp_error = 'image prep worker: '
+        .. image_prep_worker_error
+    echohl ErrorMsg
+    echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+    echohl None
+    return {
+        'id': request_id,
+        'ok': false,
+        'error': image_prep_worker_error
+    }
+enddef
+
+def ImagePrepWorkerRequest(command: dict<any>): dict<any>
+    if !ImagePrepWorkerReady()
+        StartImagePrepWorker()
+    endif
+
+    if !ImagePrepWorkerReady()
+        image_prep_worker_error = 'worker is not ready; job status='
+            .. ImagePrepWorkerJobStatus() .. ', channel status='
+            .. ImagePrepWorkerChannelStatus()
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return {'ok': false, 'error': image_prep_worker_error}
+    endif
+
+    image_prep_worker_next_request_id += 1
+    var request_id: string = string(getpid()) .. '-'
+        .. string(image_prep_worker_next_request_id)
+    command['id'] = request_id
+    image_prep_worker_last_request = json_encode(command)
+
+    try
+        ch_sendraw(image_prep_worker_channel,
+            image_prep_worker_last_request .. "\n")
+    catch
+        image_prep_worker_error = 'ch_sendraw() failed: ' .. v:exception
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return {
+            'id': request_id,
+            'ok': false,
+            'error': image_prep_worker_error
+        }
+    endtry
+
+    var response_any: any = ImagePrepWorkerReadResponse(request_id,
+        ImagePrepWorkerTimeoutMs())
+    if type(response_any) != v:t_dict
+        image_prep_worker_error = 'worker returned a non-dict response'
+        ueberzugpp_error = 'image prep worker: '
+            .. image_prep_worker_error
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return {
+            'id': request_id,
+            'ok': false,
+            'error': image_prep_worker_error
+        }
+    endif
+
+    var response: dict<any> = response_any
+    image_prep_worker_last_response = json_encode(response)
+
+    if !get(response, 'ok', false)
+        image_prep_worker_error = JsonValueToString(get(response, 'error',
+            'unknown worker error'))
+    endif
+
+    return response
+enddef
+
+def StopImagePrepWorker()
+    if ImagePrepWorkerReady()
+        try
+            ch_sendraw(image_prep_worker_channel,
+                json_encode({'action': 'exit', 'id': 'exit'}) .. "\n")
+        catch
+        endtry
+
+        try
+            job_stop(image_prep_worker_job, 'term')
+        catch
+        endtry
+    endif
+
+    image_prep_worker_job = v:none
+    image_prep_worker_channel = v:none
+    image_prep_worker_pid = 0
+    image_prep_worker_stdout_buffer = ''
+enddef
+
+
+def NotebookKernelTimeoutMs(): number
+    var timeout_ms: number = GetNumberSetting(
+        'python_notebook_kernel_timeout_ms', 300000)
+    if timeout_ms <= 0
+        timeout_ms = 300000
+    endif
+
+    return timeout_ms
+enddef
+
+def EnsureNotebookKernelState()
+    if !exists('b:python_notebook_kernel_job')
+        b:python_notebook_kernel_job = v:none
+    endif
+
+    if !exists('b:python_notebook_kernel_channel')
+        b:python_notebook_kernel_channel = v:none
+    endif
+
+    if !exists('b:python_notebook_kernel_pid')
+        b:python_notebook_kernel_pid = 0
+    endif
+
+    if !exists('b:python_notebook_kernel_stdout_buffer')
+        b:python_notebook_kernel_stdout_buffer = ''
+    endif
+
+    if !exists('b:python_notebook_kernel_next_request_id')
+        b:python_notebook_kernel_next_request_id = 0
+    endif
+
+    if !exists('b:python_notebook_kernel_error')
+        b:python_notebook_kernel_error = ''
+    endif
+
+    if !exists('b:python_notebook_kernel_channel_key')
+        b:python_notebook_kernel_channel_key = ''
+    endif
+
+    if !exists('b:python_notebook_kernel_job_key')
+        b:python_notebook_kernel_job_key = ''
+    endif
+enddef
+
+def NotebookKernelJobStatus(): string
+    EnsureNotebookKernelState()
+
+    if !exists('*job_status')
+        return 'job_status() unavailable'
+    endif
+
+    if type(b:python_notebook_kernel_job) != v:t_job
+        return 'none'
+    endif
+
+    try
+        return job_status(b:python_notebook_kernel_job)
+    catch
+        return 'error: ' .. v:exception
+    endtry
+enddef
+
+def NotebookKernelChannelStatus(): string
+    EnsureNotebookKernelState()
+
+    if !exists('*ch_status')
+        return 'ch_status() unavailable'
+    endif
+
+    if type(b:python_notebook_kernel_channel) != v:t_channel
+        return 'none'
+    endif
+
+    try
+        return ch_status(b:python_notebook_kernel_channel)
+    catch
+        return 'error: ' .. v:exception
+    endtry
+enddef
+
+def NotebookKernelReady(): bool
+    EnsureNotebookKernelState()
+
+    if !exists('*job_status') || !exists('*ch_status')
+        return false
+    endif
+
+    if type(b:python_notebook_kernel_job) != v:t_job
+            || job_status(b:python_notebook_kernel_job) !=# 'run'
+        return false
+    endif
+
+    if type(b:python_notebook_kernel_channel) != v:t_channel
+        return false
+    endif
+
+    var status: string = ''
+    try
+        status = ch_status(b:python_notebook_kernel_channel)
+    catch
+        return false
+    endtry
+
+    return status ==# 'open' || status ==# 'buffered'
+enddef
+
+
+def NotebookKernelObjectKey(value: any): string
+    return string(value)
+enddef
+
+def NotebookKernelFindBufferForChannel(channel: any): number
+    var channel_key: string = NotebookKernelObjectKey(channel)
+
+    for info in getbufinfo({'bufloaded': 1})
+        var bufnr_value: number = str2nr(string(get(info, 'bufnr', 0)))
+        if bufnr_value <= 0
+            continue
+        endif
+
+        if getbufvar(bufnr_value, 'python_notebook_kernel_channel_key', '')
+                ==# channel_key
+            return bufnr_value
+        endif
+    endfor
+
+    return -1
+enddef
+
+def NotebookKernelFindBufferForJob(job: any): number
+    var job_key: string = NotebookKernelObjectKey(job)
+
+    for info in getbufinfo({'bufloaded': 1})
+        var bufnr_value: number = str2nr(string(get(info, 'bufnr', 0)))
+        if bufnr_value <= 0
+            continue
+        endif
+
+        if getbufvar(bufnr_value, 'python_notebook_kernel_job_key', '')
+                ==# job_key
+            return bufnr_value
+        endif
+    endfor
+
+    return -1
+enddef
+
+def NotebookKernelClearPendingForBuffer(bufnr_value: number)
+    var bufnr_key: string = string(bufnr_value)
+
+    if has_key(notebook_kernel_pending_by_bufnr, bufnr_key)
+        var request_id: string = notebook_kernel_pending_by_bufnr[bufnr_key]
+        remove(notebook_kernel_pending_by_bufnr, bufnr_key)
+        if has_key(notebook_kernel_pending_requests, request_id)
+            remove(notebook_kernel_pending_requests, request_id)
+        endif
+        if has_key(notebook_kernel_ready_responses, request_id)
+            remove(notebook_kernel_ready_responses, request_id)
+        endif
+
+        if bufnr_value == bufnr('%')
+            var was_modifiable: bool = &l:modifiable
+            if !was_modifiable
+                setlocal modifiable
+            endif
+            try
+                ClearNotebookStatusBlocksForRequest(request_id)
+                RefreshNotebookMatches()
+            finally
+                if !was_modifiable
+                    setlocal nomodifiable
+                endif
+            endtry
+        endif
+    endif
+enddef
+
+def NotebookKernelBufferBusy(bufnr_value: number): bool
+    return has_key(notebook_kernel_pending_by_bufnr, string(bufnr_value))
+enddef
+
+def NotebookKernelNewRequestId(bufnr_value: number): string
+    EnsureNotebookKernelState()
+    b:python_notebook_kernel_next_request_id += 1
+    return string(getpid()) .. '-buf' .. string(bufnr_value)
+        .. '-' .. string(b:python_notebook_kernel_next_request_id)
+enddef
+
+def NotebookKernelStderrCb(bufnr_value: number, channel: any, message: string)
+    var clean_message: string = StripNullBytes(message)
+    if empty(clean_message)
+        return
+    endif
+
+    echohl ErrorMsg
+    echomsg 'notebook-python.vim: kernel stderr: ' .. clean_message
+    echohl None
+enddef
+
+def NotebookKernelExitCb(bufnr_value: number, job: any, status: number)
+    var bufnr_key: string = string(bufnr_value)
+    var expected_exit: bool = false
+    if has_key(notebook_kernel_expected_exit_by_bufnr, bufnr_key)
+        expected_exit = notebook_kernel_expected_exit_by_bufnr[bufnr_key]
+        remove(notebook_kernel_expected_exit_by_bufnr, bufnr_key)
+    endif
+
+    if bufnr_value > 0
+        NotebookKernelClearPendingForBuffer(bufnr_value)
+        setbufvar(bufnr_value, 'python_notebook_kernel_job', v:none)
+        setbufvar(bufnr_value, 'python_notebook_kernel_channel', v:none)
+        setbufvar(bufnr_value, 'python_notebook_kernel_pid', 0)
+        setbufvar(bufnr_value, 'python_notebook_kernel_stdout_buffer', '')
+        setbufvar(bufnr_value, 'python_notebook_kernel_channel_key', '')
+        setbufvar(bufnr_value, 'python_notebook_kernel_job_key', '')
+    endif
+
+    if status != 0 && !expected_exit
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel exited with status '
+            .. string(status)
+        echohl None
+    endif
+enddef
+
+def StartNotebookKernel()
+    EnsureNotebookKernelState()
+
+    if NotebookKernelReady()
+        return
+    endif
+
+    if !exists('*job_start') || !exists('*job_getchannel')
+            || !exists('*ch_sendraw') || !exists('*ch_readraw')
+        b:python_notebook_kernel_error =
+            'job/channel functions are unavailable in this Vim build'
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        return
+    endif
+
+    var python_cmd: string = 'python3'
+    var helper_path: string = g:python_notebook_helper
+
+    if empty(python_cmd) || !executable(python_cmd)
+        b:python_notebook_kernel_error = 'Python executable not found: '
+            .. python_cmd
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        return
+    endif
+
+    if empty(helper_path) || !filereadable(helper_path)
+        b:python_notebook_kernel_error = 'helper script not found: '
+            .. helper_path
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        return
+    endif
+
+    var argv: list<string> = [python_cmd, helper_path, '--kernel-worker']
+    var job_options: dict<any> = {
+        'in_io': 'pipe',
+        'out_io': 'pipe',
+        'err_io': 'pipe',
+        'in_mode': 'raw',
+        'out_mode': 'raw',
+        'err_mode': 'nl',
+        'drop': 'never',
+        'out_cb': function(script_sid .. 'NotebookKernelOutCb', [bufnr('%')]),
+        'err_cb': function(script_sid .. 'NotebookKernelStderrCb', [bufnr('%')]),
+        'exit_cb': function(script_sid .. 'NotebookKernelExitCb', [bufnr('%')]),
+    }
+
+    try
+        b:python_notebook_kernel_job = job_start(argv, job_options)
+    catch
+        b:python_notebook_kernel_error = 'job_start() failed: ' .. v:exception
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        b:python_notebook_kernel_job = v:none
+        b:python_notebook_kernel_channel = v:none
+        b:python_notebook_kernel_pid = 0
+        return
+    endtry
+
+    if type(b:python_notebook_kernel_job) != v:t_job
+        b:python_notebook_kernel_error =
+            'job_start() did not return a job object; returned type='
+            .. string(type(b:python_notebook_kernel_job))
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        b:python_notebook_kernel_job = v:none
+        b:python_notebook_kernel_channel = v:none
+        b:python_notebook_kernel_pid = 0
+        return
+    endif
+
+    if NotebookKernelJobStatus() !=# 'run'
+        b:python_notebook_kernel_error =
+            'worker did not start; job status=' .. NotebookKernelJobStatus()
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        b:python_notebook_kernel_job = v:none
+        b:python_notebook_kernel_channel = v:none
+        b:python_notebook_kernel_pid = 0
+        return
+    endif
+
+    try
+        b:python_notebook_kernel_channel = job_getchannel(
+            b:python_notebook_kernel_job)
+    catch
+        b:python_notebook_kernel_error = 'job_getchannel() failed: '
+            .. v:exception
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        try
+            job_stop(b:python_notebook_kernel_job, 'term')
+        catch
+        endtry
+        b:python_notebook_kernel_job = v:none
+        b:python_notebook_kernel_channel = v:none
+        b:python_notebook_kernel_pid = 0
+        return
+    endtry
+
+    try
+        var info: dict<any> = job_info(b:python_notebook_kernel_job)
+        b:python_notebook_kernel_pid = str2nr(string(get(info, 'process', 0)))
+    catch
+        b:python_notebook_kernel_pid = 0
+    endtry
+
+    b:python_notebook_kernel_channel_key = NotebookKernelObjectKey(
+        b:python_notebook_kernel_channel)
+    b:python_notebook_kernel_job_key = NotebookKernelObjectKey(
+        b:python_notebook_kernel_job)
+
+    if !NotebookKernelReady()
+        b:python_notebook_kernel_error = 'worker channel is not ready; status='
+            .. NotebookKernelJobStatus() .. ', channel status='
+            .. NotebookKernelChannelStatus()
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        try
+            job_stop(b:python_notebook_kernel_job, 'term')
+        catch
+        endtry
+        b:python_notebook_kernel_job = v:none
+        b:python_notebook_kernel_channel = v:none
+        b:python_notebook_kernel_pid = 0
+        return
+    endif
+
+    b:python_notebook_kernel_stdout_buffer = ''
+    b:python_notebook_kernel_error = ''
+    var bufnr_key: string = string(bufnr('%'))
+    if has_key(notebook_kernel_expected_exit_by_bufnr, bufnr_key)
+        remove(notebook_kernel_expected_exit_by_bufnr, bufnr_key)
+    endif
+enddef
+
+def NotebookKernelProcessResponse(bufnr_value: number, response: dict<any>)
+    var request_id: string = JsonValueToString(get(response, 'id', ''))
+    if empty(request_id)
+        return
+    endif
+
+    if !has_key(notebook_kernel_pending_requests, request_id)
+        return
+    endif
+
+    if has_key(notebook_kernel_ready_responses, request_id)
+        var existing: any = notebook_kernel_ready_responses[request_id]
+        if type(existing) == v:t_list
+            add(existing, response)
+            notebook_kernel_ready_responses[request_id] = existing
+        else
+            notebook_kernel_ready_responses[request_id] = [existing, response]
+        endif
+    else
+        notebook_kernel_ready_responses[request_id] = [response]
+    endif
+
+    var winid_value: number = bufwinid(bufnr_value)
+    if winid_value <= 0
+        return
+    endif
+
+    var old_winid: number = win_getid()
+    try
+        if win_gotoid(winid_value)
+            while has_key(notebook_kernel_ready_responses, request_id)
+                    && has_key(notebook_kernel_pending_requests, request_id)
+                FinishNotebookKernelRequest(request_id)
+            endwhile
+        endif
+    finally
+        if old_winid > 0
+            try
+                call win_gotoid(old_winid)
+            catch
+            endtry
+        endif
+    endtry
+enddef
+
+def NotebookKernelProcessBufferedOutput(bufnr_value: number)
+    var stdout_buffer: string = getbufvar(
+        bufnr_value, 'python_notebook_kernel_stdout_buffer', '')
+
+    while true
+        var newline_index: number = stridx(stdout_buffer, "\n")
+        if newline_index < 0
+            break
+        endif
+
+        var line_str: string = strpart(stdout_buffer, 0, newline_index)
+        stdout_buffer = strpart(stdout_buffer, newline_index + 1)
+        line_str = substitute(StripNullBytes(line_str), '\r$', '', '')
+
+        if empty(line_str)
+            continue
+        endif
+
+        var decoded: any = v:none
+        try
+            decoded = json_decode(line_str)
+        catch
+            setbufvar(bufnr_value, 'python_notebook_kernel_error',
+                'could not decode kernel response: ' .. line_str)
+            continue
+        endtry
+
+        if type(decoded) != v:t_dict
+            setbufvar(bufnr_value, 'python_notebook_kernel_error',
+                'kernel response was not a dict: ' .. line_str)
+            continue
+        endif
+
+        var response: dict<any> = decoded
+        NotebookKernelProcessResponse(bufnr_value, response)
+    endwhile
+
+    setbufvar(bufnr_value, 'python_notebook_kernel_stdout_buffer',
+        stdout_buffer)
+enddef
+
+def NotebookKernelOutCb(bufnr_value: number, channel: any, message: string)
+    if bufnr_value <= 0
+        return
+    endif
+
+    var stdout_buffer: string = getbufvar(
+        bufnr_value, 'python_notebook_kernel_stdout_buffer', '')
+    stdout_buffer ..= message
+    setbufvar(bufnr_value, 'python_notebook_kernel_stdout_buffer',
+        stdout_buffer)
+    NotebookKernelProcessBufferedOutput(bufnr_value)
+enddef
+
+def NotebookKernelSendAsync(command: dict<any>, pending: dict<any>): bool
+    EnsureNotebookKernelState()
+
+    var bufnr_value: number = bufnr('%')
+    if NotebookKernelBufferBusy(bufnr_value)
+        echohl WarningMsg
+        echomsg 'notebook-python.vim: kernel is already executing for this buffer'
+        echohl None
+        return false
+    endif
+
+    if !NotebookKernelReady()
+        StartNotebookKernel()
+    endif
+
+    if !NotebookKernelReady()
+        b:python_notebook_kernel_error = 'worker is not ready; job status='
+            .. NotebookKernelJobStatus() .. ', channel status='
+            .. NotebookKernelChannelStatus()
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        return false
+    endif
+
+    var request_id: string = JsonValueToString(get(pending, 'id', ''))
+    if empty(request_id)
+        request_id = NotebookKernelNewRequestId(bufnr_value)
+    endif
+    command['id'] = request_id
+
+    pending['id'] = request_id
+    pending['bufnr'] = bufnr_value
+    notebook_kernel_pending_requests[request_id] = pending
+    notebook_kernel_pending_by_bufnr[string(bufnr_value)] = request_id
+
+    try
+        ch_sendraw(b:python_notebook_kernel_channel,
+            json_encode(command) .. "\n")
+    catch
+        NotebookKernelClearPendingForBuffer(bufnr_value)
+        b:python_notebook_kernel_error = 'ch_sendraw() failed: ' .. v:exception
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: kernel: '
+            .. b:python_notebook_kernel_error
+        echohl None
+        return false
+    endtry
+
+    return true
+enddef
+
+def StopNotebookKernelForBuffer(bufnr_value: number)
+    if bufnr_value <= 0
+        return
+    endif
+
+    var bufnr_key: string = string(bufnr_value)
+    NotebookKernelClearPendingForBuffer(bufnr_value)
+
+    var kernel_job: any = getbufvar(bufnr_value,
+        'python_notebook_kernel_job', v:none)
+    var kernel_channel: any = getbufvar(bufnr_value,
+        'python_notebook_kernel_channel', v:none)
+
+    if type(kernel_channel) == v:t_channel
+        var channel_status: string = ''
+        try
+            channel_status = ch_status(kernel_channel)
+        catch
+            channel_status = ''
+        endtry
+
+        if channel_status ==# 'open' || channel_status ==# 'buffered'
+            notebook_kernel_expected_exit_by_bufnr[bufnr_key] = true
+            try
+                ch_sendraw(kernel_channel,
+                    json_encode({'action': 'exit', 'id': 'exit'}) .. "\n")
+            catch
+            endtry
+        endif
+    endif
+
+    if type(kernel_job) == v:t_job
+        var job_status_value: string = ''
+        try
+            job_status_value = job_status(kernel_job)
+        catch
+            job_status_value = ''
+        endtry
+
+        if job_status_value ==# 'run'
+            notebook_kernel_expected_exit_by_bufnr[bufnr_key] = true
+            try
+                job_stop(kernel_job, 'term')
+            catch
+            endtry
+        endif
+    endif
+
+    setbufvar(bufnr_value, 'python_notebook_kernel_job', v:none)
+    setbufvar(bufnr_value, 'python_notebook_kernel_channel', v:none)
+    setbufvar(bufnr_value, 'python_notebook_kernel_pid', 0)
+    setbufvar(bufnr_value, 'python_notebook_kernel_stdout_buffer', '')
+    setbufvar(bufnr_value, 'python_notebook_kernel_error', '')
+    setbufvar(bufnr_value, 'python_notebook_kernel_channel_key', '')
+    setbufvar(bufnr_value, 'python_notebook_kernel_job_key', '')
+enddef
+
+def StopNotebookKernel()
+    EnsureNotebookKernelState()
+    StopNotebookKernelForBuffer(bufnr('%'))
+enddef
+
+def StopAllNotebookKernels()
+    for info in getbufinfo({'bufloaded': 1})
+        var bufnr_value: number = str2nr(string(get(info, 'bufnr', 0)))
+        if bufnr_value > 0
+            StopNotebookKernelForBuffer(bufnr_value)
+        endif
+    endfor
+enddef
+
+def RestartNotebookKernel()
+    StopNotebookKernel()
+    echomsg 'notebook-python.vim: kernel restarted'
+enddef
+
+def WindowTextWidth(): number
+    var text_width: number = winwidth(0)
+
+    if exists('*getwininfo')
+        var wininfo: dict<any> = getwininfo(win_getid())[0]
+        text_width = str2nr(string(get(wininfo, 'width', text_width)))
+
+        if has_key(wininfo, 'textoff')
+            text_width -= str2nr(string(get(wininfo, 'textoff', 0)))
+        endif
+    endif
+
+    return max([1, text_width])
+enddef
+
+def FigureDisplayLines(path: string, available_cols: number): number
+    var max_lines: number = g:python_notebook_figure_lines
+
+    if !filereadable(path)
+        return max_lines
+    endif
+
+    var engine: string = GetStringSetting(
+        'python_notebook_draw_engine', 'chafa')
+    var python_cmd: string = 'python3'
+    var helper_path: string = g:python_notebook_helper
+
+    if empty(python_cmd) || !executable(python_cmd)
+        return max_lines
+    endif
+
+    if empty(helper_path) || !filereadable(helper_path)
+        return max_lines
+    endif
+
+    var max_pixel_width: number = max([1, available_cols * CellWidth()])
+    var cell_height: number = CellHeight()
+
+    if engine ==# 'magick'
+        max_pixel_width = max([1, available_cols * CellWidth()])
+        cell_height = CellHeight()
+    elseif engine ==# 'ueberzugpp'
+        max_pixel_width = max([1, available_cols * CellWidth()])
+        cell_height = CellHeight()
+    else
+        assert_true(engine ==# 'chafa')
+    endif
+
+    var output: list<string> = systemlist(ShellCommand([
+        python_cmd,
+        helper_path,
+        '--sixel-display-lines',
+        path,
+        string(max_pixel_width),
+        string(cell_height),
+        string(max_lines)
+    ]))
+
+    if v:shell_error != 0 || empty(output)
+        return max_lines
+    endif
+
+    var display_lines: number = str2nr(output[0])
+    if display_lines <= 0
+        return max_lines
+    endif
+
+    return min([display_lines, max_lines])
+enddef
+
+def StripNullBytes(text: string): string
+    return substitute(text, '\%x00', '', 'g')
+enddef
+
+def StripNullBytesFromLines(lines: list<string>): list<string>
+    return mapnew(lines, (_, line_str) => StripNullBytes(line_str))
+enddef
+
+def ShellCommand(argv: list<string>): string
+    return join(mapnew(argv, (_, item) => shellescape(item)), ' ')
+enddef
+
+def LastNonBlankLineInRange(
+    start_lnum: number,
+    end_lnum: number,
+    fallback_lnum: number
+): number
+    var lnum: number = end_lnum
+
+    while lnum >= start_lnum
+        if getline(lnum) !~# '^\s*$'
+            return lnum
+        endif
+
+        lnum -= 1
+    endwhile
+
+    return fallback_lnum
+enddef
+
+def EnsureBufferMatchList()
+    if !exists('b:python_notebook_match_ids')
+        b:python_notebook_match_ids = []
+    endif
+enddef
+
+def EnsureNotebookHighlightGroups()
+    execute 'highlight default link PythonNotebookOutput Comment'
+    execute 'highlight PythonNotebookFigure ctermfg=DarkGray ctermbg=NONE '
+        .. 'guifg=#808080 guibg=NONE'
+    execute 'highlight PythonNotebookError ctermfg=Red ctermbg=NONE '
+        .. 'guifg=#ff5f5f guibg=NONE'
+    execute 'highlight PythonNotebookStdout ctermfg=White ctermbg=NONE '
+        .. 'guifg=#ffffff guibg=NONE'
+    execute 'highlight PythonNotebookResult ctermfg=Blue ctermbg=NONE '
+        .. 'guifg=#5fafff guibg=NONE'
+    execute 'highlight PythonNotebookStatus ctermfg=Yellow ctermbg=NONE '
+        .. 'guifg=#ffff5f guibg=NONE'
+enddef
+
+def HasNotebookAnnotation(): bool
+    var scan_lines: number = g:python_notebook_annotation_scan_lines
+    if scan_lines <= 0
+        scan_lines = 40
+    endif
+
+    var max_lnum: number = min([line('$'), scan_lines])
+    if max_lnum <= 0
+        return false
+    endif
+
+    for lnum in range(1, max_lnum)
+        var line_str: string = getline(lnum)
+
+        if line_str =~# '^\s*#\s*notebook-python:\s*enable\s*$'
+            return true
+        endif
+
+        if line_str =~# '^\s*#\s*nb:\s*enable\s*$'
+            return true
+        endif
+    endfor
+
+    return false
+enddef
+
+def IsPythonBuffer(): bool
+    if &filetype ==# 'python'
+        return true
+    endif
+
+    return expand('%:e') ==# 'py'
+enddef
+
+def IsCellMarker(line_str: string): bool
+    return line_str =~# '^\s*#\s*%%'
+enddef
+
+def IsOutputStart(line_str: string): bool
+    return line_str =~# '^\s*#\s*nb-output\s*:\s*start\>'
+enddef
+
+def IsOutputEnd(line_str: string): bool
+    return line_str =~# '^\s*#\s*nb-output\s*:\s*end\s*$'
+enddef
+
+def IsErrorStart(line_str: string): bool
+    return line_str =~# '^\s*#\s*nb-error\s*:\s*start\>'
+enddef
+
+def IsErrorEnd(line_str: string): bool
+    return line_str =~# '^\s*#\s*nb-error\s*:\s*end\s*$'
+enddef
+
+def IsStatusStart(line_str: string): bool
+    return line_str =~# '^\s*#\s*nb-status\s*:\s*start\>'
+enddef
+
+def IsStatusEnd(line_str: string): bool
+    return line_str =~# '^\s*#\s*nb-status\s*:\s*end\s*$'
+enddef
+
+def IsFigureLine(line_str: string): bool
+    return line_str =~# '^\s*#\s*nb-figure\s*:\s*.\+'
+enddef
+
+def ResolveFigureRef(figure_ref: string): string
+    var ref: string = StripNullBytes(figure_ref)
+
+    if empty(ref)
+        return ''
+    endif
+
+    if strpart(ref, 0, 1) ==# '/'
+        return ref
+    endif
+
+    if strpart(ref, 0, 1) ==# '~'
+        return expand(ref)
+    endif
+
+    return NotebookFigureDir() .. '/' .. ref
+enddef
+
+def FigurePathFromLine(line_str: string): string
+    var figure_ref: string = substitute(
+        line_str, '^\s*#\s*nb-figure\s*:\s*', '', '')
+    return ResolveFigureRef(figure_ref)
+enddef
+
+def DisplayFigureRef(path_or_name: string): string
+    var ref: string = StripNullBytes(path_or_name)
+
+    if empty(ref)
+        return ''
+    endif
+
+    if ref =~# '/'
+        return fnamemodify(ref, ':t')
+    endif
+
+    return ref
+enddef
+
+def IsGeneratedStart(line_str: string): bool
+    return IsOutputStart(line_str) || IsErrorStart(line_str)
+        || IsStatusStart(line_str)
+enddef
+
+def IsGeneratedEnd(line_str: string): bool
+    return IsOutputEnd(line_str) || IsErrorEnd(line_str)
+        || IsStatusEnd(line_str)
+enddef
+
+def FindGeneratedEnd(start_lnum: number): number
+    var lnum: number = start_lnum
+    var max_lnum: number = line('$')
+
+    while lnum <= max_lnum
+        if IsGeneratedEnd(getline(lnum))
+            return lnum
+        endif
+        lnum += 1
+    endwhile
+
+    return 0
+enddef
+
+def FindFigureAreaEnd(figure_lnum: number): number
+    var lnum: number = figure_lnum + 1
+    var max_lnum: number = line('$')
+
+    while lnum <= max_lnum
+        var line_str: string = getline(lnum)
+
+        if IsOutputEnd(line_str) || IsFigureLine(line_str)
+                || IsErrorStart(line_str)
+            return lnum - 1
+        endif
+
+        lnum += 1
+    endwhile
+
+    return max_lnum
+enddef
+
+def OutputHeaderHasKind(line_str: string, kind: string): bool
+    return line_str =~# '\[' && line_str =~# '\<' .. kind .. '\>'
+enddef
+
+def JsonValueToString(value: any): string
+    if type(value) == v:t_string
+        return StripNullBytes(value)
+    endif
+
+    var text: string = string(value)
+    if text ==# 'v:none' || text ==# 'v:null' || text ==# 'null'
+        return ''
+    endif
+
+    return StripNullBytes(text)
+enddef
+
+def JsonValueToStringList(value: any): list<string>
+    if type(value) != v:t_list
+        return []
+    endif
+
+    var result: list<string> = []
+    for item in value
+        add(result, JsonValueToString(item))
+    endfor
+
+    return result
+enddef
+
+def JsonValueToFloat(value: any, default_value: float): float
+    if type(value) == v:t_float
+        return value
+    endif
+
+    if type(value) == v:t_number || type(value) == v:t_string
+        var text: string = JsonValueToString(value)
+        if !empty(text)
+            return str2float(text)
+        endif
+    endif
+
+    return default_value
+enddef
+
+def FormatElapsedSeconds(seconds: float): string
+    if seconds < 0.0
+        return ''
+    endif
+
+    if seconds < 1.0
+        return printf('%.1fms', seconds * 1000.0)
+    endif
+
+    if seconds < 60.0
+        return printf('%.3fs', seconds)
+    endif
+
+    return printf('%.1fs', seconds)
+enddef
+
+def ResultElapsedLabel(result: dict<any>): string
+    if !g:python_notebook_show_cell_timings
+        return ''
+    endif
+
+    var seconds: float = JsonValueToFloat(get(result, 'elapsed_seconds', -1.0), -1.0)
+    if seconds < 0.0
+        return ''
+    endif
+
+    var label: string = FormatElapsedSeconds(seconds)
+    if empty(label)
+        return ''
+    endif
+
+    return 'elapsed=' .. label
+enddef
+
+def JsonFigureRefs(value: any): list<string>
+    if type(value) != v:t_list
+        return []
+    endif
+
+    var result: list<string> = []
+
+    for item in value
+        if type(item) == v:t_dict
+            var name: string = JsonValueToString(get(item, 'name', ''))
+            if !empty(name)
+                add(result, DisplayFigureRef(name))
+                continue
+            endif
+
+            var path: string = JsonValueToString(get(item, 'path', ''))
+            if !empty(path)
+                add(result, DisplayFigureRef(path))
+            endif
+        else
+            var ref: string = JsonValueToString(item)
+            if !empty(ref)
+                add(result, DisplayFigureRef(ref))
+            endif
+        endif
+    endfor
+
+    return result
+enddef
+
+def ResultHasFigure(result: dict<any>): bool
+    return !empty(JsonFigureRefs(get(result, 'figures', [])))
+enddef
+
+def CellLineToBufferLine(cell: dict<any>, relative_line: number): number
+    if relative_line <= 0
+        return str2nr(string(get(cell, 'insert_after', line('$'))))
+    endif
+
+    return str2nr(string(get(cell, 'code_start', 1))) + relative_line - 1
+enddef
+
+def OutputInsertLineForResult(cell: dict<any>, result: dict<any>): number
+    var insert_lnum: number = str2nr(string(
+        get(cell, 'insert_after', line('$'))))
+
+    if ResultHasFigure(result)
+        var figure_line: number = str2nr(string(get(result, 'figure_line', 0)))
+        if figure_line > 0
+            insert_lnum = CellLineToBufferLine(cell, figure_line)
+        endif
+    endif
+
+    return insert_lnum
+enddef
+
+def ClearNotebookMatches()
+    EnsureBufferMatchList()
+
+    for match_id in b:python_notebook_match_ids
+        try
+            matchdelete(match_id)
+        catch
+        endtry
+    endfor
+
+    b:python_notebook_match_ids = []
+enddef
+
+def AddNotebookLineMatch(group_name: string, row: number)
+    EnsureBufferMatchList()
+    add(b:python_notebook_match_ids,
+        matchadd(group_name, '\%' .. row .. 'l.*', 100))
+enddef
+
+def AddNotebookHeaderWordMatch(group_name: string, row: number, word: string)
+    EnsureBufferMatchList()
+    add(b:python_notebook_match_ids,
+        matchadd(group_name, '\%' .. row .. 'l.*\zs\<' .. word .. '\>', 110))
+enddef
+
+def RefreshNotebookMatches()
+    if !exists('b:python_notebook_active')
+        return
+    endif
+
+    EnsureNotebookHighlightGroups()
+    EnsureBufferMatchList()
+    ClearNotebookMatches()
+
+    var lnum: number = 1
+    var max_lnum: number = line('$')
+
+    while lnum <= max_lnum
+        var line_str: string = getline(lnum)
+
+        if IsErrorStart(line_str)
+            var end_lnum: number = FindGeneratedEnd(lnum)
+            if end_lnum <= 0
+                end_lnum = lnum
+            endif
+
+            for row in range(lnum, end_lnum)
+                AddNotebookLineMatch('PythonNotebookError', row)
+            endfor
+
+            lnum = end_lnum + 1
+            continue
+        endif
+
+        if IsStatusStart(line_str)
+            var status_end: number = FindGeneratedEnd(lnum)
+            if status_end <= 0
+                status_end = lnum
+            endif
+
+            for row in range(lnum, status_end)
+                AddNotebookLineMatch('PythonNotebookStatus', row)
+            endfor
+
+            lnum = status_end + 1
+            continue
+        endif
+
+        if IsOutputStart(line_str)
+            var output_end: number = FindGeneratedEnd(lnum)
+            if output_end <= 0
+                output_end = lnum
+            endif
+
+            var has_stdout: bool = OutputHeaderHasKind(line_str, 'stdout')
+            var has_stderr: bool = OutputHeaderHasKind(line_str, 'stderr')
+            var has_result: bool = OutputHeaderHasKind(line_str, 'result')
+            var has_figure: bool = OutputHeaderHasKind(line_str, 'figure')
+
+            if has_stdout
+                AddNotebookHeaderWordMatch('PythonNotebookStdout',
+                                           lnum, 'stdout')
+            endif
+
+            if has_stderr
+                AddNotebookHeaderWordMatch('PythonNotebookStdout',
+                                           lnum, 'stderr')
+            endif
+
+            if has_result
+                AddNotebookHeaderWordMatch('PythonNotebookResult',
+                                           lnum, 'result')
+            endif
+
+            if has_figure
+                AddNotebookHeaderWordMatch('PythonNotebookFigure',
+                                           lnum, 'figure')
+            endif
+
+            var first_figure_lnum: number = 0
+            var scan_lnum: number = lnum + 1
+            while scan_lnum < output_end
+                if IsFigureLine(getline(scan_lnum))
+                    first_figure_lnum = scan_lnum
+                    break
+                endif
+                scan_lnum += 1
+            endwhile
+
+            var body_start: number = lnum + 1
+            var body_end: number = output_end - 1
+            if first_figure_lnum > 0
+                body_end = first_figure_lnum - 1
+            endif
+
+            if body_start <= body_end
+                if has_result && !has_stdout && !has_stderr
+                    for row in range(body_start, body_end)
+                        AddNotebookLineMatch('PythonNotebookResult', row)
+                    endfor
+                elseif has_result
+                    if body_start <= body_end - 1
+                        for row in range(body_start, body_end - 1)
+                            AddNotebookLineMatch('PythonNotebookStdout', row)
+                        endfor
+                    endif
+
+                    AddNotebookLineMatch('PythonNotebookResult', body_end)
+                else
+                    for row in range(body_start, body_end)
+                        AddNotebookLineMatch('PythonNotebookStdout', row)
+                    endfor
+                endif
+            endif
+
+            if first_figure_lnum > 0
+                var figure_lnum: number = first_figure_lnum
+                while figure_lnum < output_end
+                    if IsFigureLine(getline(figure_lnum))
+                        var figure_area_end: number = FindFigureAreaEnd(
+                            figure_lnum)
+                        for row in range(figure_lnum,
+                                min([figure_area_end, output_end - 1]))
+                            AddNotebookLineMatch('PythonNotebookFigure', row)
+                        endfor
+                        figure_lnum = figure_area_end + 1
+                    else
+                        figure_lnum += 1
+                    endif
+                endwhile
+            endif
+
+            lnum = output_end + 1
+            continue
+        endif
+
+        lnum += 1
+    endwhile
+enddef
+
+def JumpToFirstNotebookError(): bool
+    var lnum: number = 1
+    var max_lnum: number = line('$')
+
+    while lnum <= max_lnum
+        if IsErrorStart(getline(lnum))
+            cursor(lnum, 1)
+            silent! normal! zz
+            return true
+        endif
+
+        lnum += 1
+    endwhile
+
+    return false
+enddef
+
+def ClearNotebookOutputs()
+    ClearExternalImages()
+    ClearNotebookMatches()
+
+    var was_modifiable: bool = &l:modifiable
+    if !was_modifiable
+        setlocal modifiable
+    endif
+
+    try
+        var lnum: number = 1
+
+        while lnum <= line('$')
+            if IsGeneratedStart(getline(lnum))
+                var end_lnum: number = FindGeneratedEnd(lnum)
+                if end_lnum > 0
+                    deletebufline(bufnr('%'), lnum, end_lnum)
+                else
+                    deletebufline(bufnr('%'), lnum)
+                endif
+                continue
+            endif
+
+            lnum += 1
+        endwhile
+    finally
+        if !was_modifiable
+            setlocal nomodifiable
+        endif
+    endtry
+enddef
+
+def ParseNotebookCells(): list<dict<any>>
+    var cells: list<dict<any>> = []
+    var max_lnum: number = line('$')
+    var markers: list<number> = []
+
+    for lnum in range(1, max_lnum)
+        if IsCellMarker(getline(lnum))
+            add(markers, lnum)
+        endif
+    endfor
+
+    if empty(markers)
+        var lines: list<string> = []
+        if max_lnum > 0
+            lines = getline(1, max_lnum)
+        endif
+
+        var insert_after: number = LastNonBlankLineInRange(
+            1, max_lnum, max_lnum)
+
+        add(cells, {
+            'index': 0,
+            'marker_lnum': 0,
+            'code_start': 1,
+            'code_end': max_lnum,
+            'insert_after': insert_after,
+            'lines': StripNullBytesFromLines(lines),
+        })
+
+        return cells
+    endif
+
+    if markers[0] > 1
+        var pre_lines: list<string> = getline(1, markers[0] - 1)
+        var pre_insert_after: number = LastNonBlankLineInRange(
+            1, markers[0] - 1, markers[0] - 1)
+
+        add(cells, {
+            'index': len(cells),
+            'marker_lnum': 0,
+            'code_start': 1,
+            'code_end': markers[0] - 1,
+            'insert_after': pre_insert_after,
+            'lines': StripNullBytesFromLines(pre_lines),
+        })
+    endif
+
+    for i in range(0, len(markers) - 1)
+        var marker_lnum: number = markers[i]
+        var code_start: number = marker_lnum + 1
+        var code_end: number = max_lnum
+
+        if i + 1 < len(markers)
+            code_end = markers[i + 1] - 1
+        endif
+
+        var code_lines: list<string> = []
+        if code_start <= code_end
+            code_lines = getline(code_start, code_end)
+        endif
+
+        var insert_after: number = marker_lnum
+        if code_start <= code_end
+            insert_after = LastNonBlankLineInRange(
+                code_start, code_end, marker_lnum)
+        endif
+
+        add(cells, {
+            'index': len(cells),
+            'marker_lnum': marker_lnum,
+            'code_start': code_start,
+            'code_end': code_end,
+            'insert_after': insert_after,
+            'lines': StripNullBytesFromLines(code_lines),
+        })
+    endfor
+
+    return cells
+enddef
+
+def CommentLine(line_str: string): string
+    var clean_line: string = StripNullBytes(line_str)
+
+    if empty(clean_line)
+        return '#'
+    endif
+
+    return '# ' .. clean_line
+enddef
+
+def ExtendCommented(lines: list<string>, source_lines: list<string>)
+    for line_str in source_lines
+        add(lines, CommentLine(line_str))
+    endfor
+enddef
+
+def BuildOutputHeader(
+    has_stdout: bool,
+    has_stderr: bool,
+    has_result: bool,
+    has_figure: bool,
+    elapsed_label: string
+): string
+    var parts: list<string> = []
+
+    if has_stdout
+        add(parts, 'stdout')
+    endif
+
+    if has_stderr
+        add(parts, 'stderr')
+    endif
+
+    if has_result
+        add(parts, 'result')
+    endif
+
+    if has_figure
+        add(parts, 'figure')
+    endif
+
+    var header: string = output_start_marker_prefix
+    if empty(parts)
+        header ..= ' []'
+    else
+        header ..= ' [' .. join(parts, ', ') .. ']'
+    endif
+
+    if !empty(elapsed_label)
+        header ..= ' ' .. elapsed_label
+    endif
+
+    return header
+enddef
+
+def BuildOutputBlock(result: dict<any>): list<string>
+    var block: list<string> = []
+
+    var stdout_lines: list<string> = JsonValueToStringList(
+        get(result, 'stdout', []))
+    var stderr_lines: list<string> = JsonValueToStringList(
+        get(result, 'stderr', []))
+    var result_text: string = JsonValueToString(get(result, 'result', ''))
+    var figure_refs: list<string> = JsonFigureRefs(get(result, 'figures', []))
+
+    var has_stdout: bool = !empty(stdout_lines)
+    var has_stderr: bool = !empty(stderr_lines)
+    var has_result: bool = !empty(result_text)
+    var has_figure: bool = !empty(figure_refs)
+    var elapsed_label: string = ResultElapsedLabel(result)
+
+    if !has_stdout && !has_stderr && !has_result && !has_figure
+            && empty(elapsed_label)
+        return block
+    endif
+
+    add(block, BuildOutputHeader(
+        has_stdout, has_stderr, has_result, has_figure, elapsed_label))
+
+    if has_stdout
+        ExtendCommented(block, stdout_lines)
+    endif
+
+    if has_stderr
+        ExtendCommented(block, stderr_lines)
+    endif
+
+    if has_result
+        add(block, CommentLine(result_text))
+    endif
+
+    if has_figure
+        var available_cols: number = WindowTextWidth()
+
+        for figure_ref in figure_refs
+            add(block, figure_marker_prefix .. figure_ref)
+
+            var figure_path: string = ResolveFigureRef(figure_ref)
+            var figure_lines: number = FigureDisplayLines(
+                figure_path, available_cols)
+            for _ in range(1, figure_lines)
+                add(block, '#')
+            endfor
+        endfor
+    endif
+
+    add(block, output_end_marker)
+    return block
+enddef
+
+def BuildErrorBlock(result: dict<any>): list<string>
+    var error_lines: list<string> = JsonValueToStringList(
+        get(result, 'error', []))
+    if empty(error_lines)
+        return []
+    endif
+
+    var block: list<string> = [error_start_marker]
+    ExtendCommented(block, error_lines)
+    add(block, error_end_marker)
+
+    return block
+enddef
+
+def SixelCacheKey(
+    path: string,
+    available_cols: number,
+    available_lines: number,
+    crop_top_lines: number,
+    total_lines: number,
+    engine: string
+): string
+    var file_size: number = getfsize(path)
+    var file_mtime: number = getftime(path)
+    var extra_key: string = ''
+
+    if engine ==# 'chafa'
+        var helper_path: string = g:python_notebook_helper
+        extra_key = ':' .. 'python3' .. ':' .. helper_path .. ':'
+            .. getftime(helper_path) .. ':' .. CellWidth() .. 'x'
+            .. CellHeight()
+    elseif engine ==# 'magick'
+        extra_key = ':' .. 'magick' .. ':'
+            .. CellWidth() .. 'x' .. CellHeight()
+    endif
+
+    return engine .. ':' .. path .. ':' .. file_size .. ':' .. file_mtime
+        .. ':' .. available_cols .. 'x' .. available_lines .. '@'
+        .. crop_top_lines .. '/total=' .. total_lines .. extra_key
+enddef
+
+def GenerateFigureSixel(
+    path: string,
+    available_cols: number,
+    available_lines: number,
+    crop_top_lines: number,
+    total_lines: number
+): string
+    if !filereadable(path)
+        return ''
+    endif
+
+    var engine: string = GetStringSetting('python_notebook_draw_engine',
+        'chafa')
+    var current_cell_width: number = CellWidth()
+    var current_cell_height: number = CellHeight()
+    var layout_key: string = ImagePrepLayoutKey(path, total_lines,
+        available_cols)
+    var cache_key: string = SixelCacheKey(path, available_cols,
+        available_lines, crop_top_lines, total_lines, engine)
+    if has_key(figure_sixel_cache, cache_key)
+        return figure_sixel_cache[cache_key]
+    endif
+
+    var sixel_data: string = ''
+
+    if engine ==# 'chafa'
+        if !executable('chafa')
+            return ''
+        endif
+
+        var python_cmd: string = 'python3'
+        var helper_path: string = g:python_notebook_helper
+
+        if empty(python_cmd) || !executable(python_cmd)
+            return ''
+        endif
+
+        if empty(helper_path) || !filereadable(helper_path)
+            return ''
+        endif
+
+        var max_pixel_width: number = max([1,
+            available_cols * current_cell_width])
+        var max_pixel_height: number = max([1,
+            total_lines * current_cell_height])
+        var crop_top_pixels: number = max([0,
+            crop_top_lines * current_cell_height])
+        var crop_height_pixels: number = max([1,
+            available_lines * current_cell_height])
+        var prepared_path: string = tempname() .. '.png'
+
+        try
+            var worker_path: string = PrepareImageWithWorker(path,
+                prepared_path, max_pixel_width, max_pixel_height,
+                crop_top_pixels, crop_height_pixels, 'sixel',
+                'chafa image prep', layout_key, current_cell_width,
+                current_cell_height)
+            if !empty(worker_path)
+                prepared_path = worker_path
+            else
+                return ''
+            endif
+
+            # The helper fits the PNG into the reserved terminal-cell box,
+            # crops the visible vertical slice, then applies the
+            # transparent-palette preparation needed for clean sixel output.
+            # Do not pass -s here, because that would resize the prepared
+            # paletted image again.
+            sixel_data = system(ShellCommand([
+                'chafa', '-f', 'sixel', '--dither', 'diffusion', prepared_path
+            ]))
+        finally
+            if !empty(prepared_path) && filereadable(prepared_path)
+                delete(prepared_path)
+            endif
+        endtry
+    elseif engine ==# 'magick'
+        var magick_cmd: string = 'magick'
+        if empty(magick_cmd) || !executable(magick_cmd)
+            return ''
+        endif
+
+        var python_cmd: string = 'python3'
+        var helper_path: string = g:python_notebook_helper
+        if empty(python_cmd) || !executable(python_cmd)
+            return ''
+        endif
+
+        if empty(helper_path) || !filereadable(helper_path)
+            return ''
+        endif
+
+        var pixel_width: number = max([1,
+            available_cols * current_cell_width])
+        var max_pixel_height: number = max([1,
+            total_lines * current_cell_height])
+        var crop_top_pixels: number = max([0,
+            crop_top_lines * current_cell_height])
+        var crop_height_pixels: number = max([1,
+            available_lines * current_cell_height])
+        var prepared_path: string = tempname() .. '.png'
+
+        try
+            var worker_path: string = PrepareImageWithWorker(path,
+                prepared_path, pixel_width, max_pixel_height,
+                crop_top_pixels, crop_height_pixels, 'rgba',
+                'magick image prep', layout_key, current_cell_width,
+                current_cell_height)
+            if !empty(worker_path)
+                prepared_path = worker_path
+            else
+                return ''
+            endif
+
+            sixel_data = system(ShellCommand([
+                magick_cmd, prepared_path, 'sixel:-'
+            ]))
+        finally
+            if !empty(prepared_path) && filereadable(prepared_path)
+                delete(prepared_path)
+            endif
+        endtry
+    else
+        return ''
+    endif
+
+    if v:shell_error != 0
+        return ''
+    endif
+
+    sixel_data = substitute(sixel_data, '\n\+$', '', '')
+    figure_sixel_cache[cache_key] = sixel_data
+    return sixel_data
+enddef
+
+def StartUeberzugppLayerDaemon()
+    var engine: string = GetStringSetting('python_notebook_draw_engine',
+        'chafa')
+    if !(engine ==# 'ueberzugpp')
+        return
+    endif
+
+    if UeberzugppLayerReady()
+        return
+    endif
+
+    if !exists('*job_start')
+        ueberzugpp_error = 'job_start() is unavailable in this Vim build'
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    if !exists('*job_getchannel')
+        ueberzugpp_error = 'job_getchannel() is unavailable in this Vim build'
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    if !exists('*ch_sendraw')
+        ueberzugpp_error = 'ch_sendraw() is unavailable in this Vim build'
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    var ueberzugpp_cmd: string = 'ueberzugpp'
+    if empty(ueberzugpp_cmd)
+        ueberzugpp_error = 'g:python_notebook_ueberzugpp_command is empty'
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    if !executable(ueberzugpp_cmd)
+        ueberzugpp_error = 'command is not executable: ' .. ueberzugpp_cmd
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return
+    endif
+
+    var argv: list<string> = [
+        UeberzugppExecutable(), 'layer', '--silent', '--use-escape-codes'
+    ]
+    var output: string = UeberzugppOutput()
+    if !empty(output)
+        extend(argv, ['-o', output])
+    endif
+
+    var job_options: dict<any> = {
+        'in_io': 'pipe',
+        'err_io': 'pipe',
+        'err_mode': 'nl',
+        'err_cb': function(script_sid .. 'UeberzugppStderrCb'),
+        'exit_cb': function(script_sid .. 'UeberzugppExitCb'),
+    }
+
+    if UeberzugppStdoutToTty() && getftype('/dev/tty') !=# ''
+        job_options['out_io'] = 'file'
+        job_options['out_name'] = '/dev/tty'
+    else
+        job_options['out_io'] = 'pipe'
+        job_options['out_mode'] = 'nl'
+        job_options['out_cb'] = function(script_sid .. 'UeberzugppStdoutCb')
+    endif
+
+    try
+        ueberzugpp_job = job_start(argv, job_options)
+    catch
+        ueberzugpp_error = 'job_start() failed: ' .. v:exception
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        ueberzugpp_job = v:none
+        ueberzugpp_channel = v:none
+        ueberzugpp_pid = 0
+        return
+    endtry
+
+    if type(ueberzugpp_job) != v:t_job
+        ueberzugpp_error =
+            'job_start() did not return a job object; returned type='
+            .. string(type(ueberzugpp_job))
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        ueberzugpp_job = v:none
+        ueberzugpp_channel = v:none
+        ueberzugpp_pid = 0
+        return
+    endif
+
+    var job_status_text: string = UeberzugppJobStatus()
+    if job_status_text !=# 'run'
+        ueberzugpp_error = 'layer job did not start; job status='
+            .. job_status_text
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        ueberzugpp_job = v:none
+        ueberzugpp_channel = v:none
+        ueberzugpp_pid = 0
+        return
+    endif
+
+    try
+        ueberzugpp_channel = job_getchannel(ueberzugpp_job)
+    catch
+        ueberzugpp_error = 'job_getchannel() failed: ' .. v:exception
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        try
+            job_stop(ueberzugpp_job, 'term')
+        catch
+        endtry
+        ueberzugpp_job = v:none
+        ueberzugpp_channel = v:none
+        ueberzugpp_pid = 0
+        return
+    endtry
+
+    try
+        var info: dict<any> = job_info(ueberzugpp_job)
+        ueberzugpp_pid = str2nr(string(get(info, 'process', 0)))
+    catch
+        ueberzugpp_pid = 0
+    endtry
+
+    if !UeberzugppLayerReady()
+        ueberzugpp_error = 'layer job channel is not ready; job status='
+            .. UeberzugppJobStatus() .. ', channel status='
+            .. UeberzugppChannelStatus()
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        try
+            job_stop(ueberzugpp_job, 'term')
+        catch
+        endtry
+        ueberzugpp_job = v:none
+        ueberzugpp_channel = v:none
+        ueberzugpp_pid = 0
+        return
+    endif
+
+    ScheduleNotebookFigureDraw(0)
+enddef
+
+def UeberzugppSendJson(command: dict<any>): bool
+    ueberzugpp_last_command = json_encode(command)
+
+    if !UeberzugppLayerReady()
+        StartUeberzugppLayerDaemon()
+    endif
+
+    if !UeberzugppLayerReady()
+        ueberzugpp_error = 'cannot send command because layer is not ready; '
+            .. 'job status=' .. UeberzugppJobStatus() .. ', channel status='
+            .. UeberzugppChannelStatus() .. ', command='
+            .. ueberzugpp_last_command
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return false
+    endif
+
+    try
+        ch_sendraw(ueberzugpp_channel, ueberzugpp_last_command .. "\n")
+    catch
+        ueberzugpp_error = 'ch_sendraw() failed: ' .. v:exception
+            .. '; command=' .. ueberzugpp_last_command
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return false
+    endtry
+
+    return true
+enddef
+
+def UeberzugppRemoveImage(identifier: string)
+    if empty(identifier)
+        return
+    endif
+
+    UeberzugppSendJson({
+        'action': 'remove',
+        'identifier': identifier,
+    })
+enddef
+
+def ClearUeberzugppImages()
+    if empty(ueberzugpp_visible_image_ids)
+        return
+    endif
+
+    for identifier in keys(ueberzugpp_visible_image_ids)
+        UeberzugppRemoveImage(identifier)
+    endfor
+
+    ueberzugpp_visible_image_ids = {}
+enddef
+
+def ClearVisibleFigureTextAreas()
+    if !exists('b:python_notebook_active')
+        return
+    endif
+
+    var screen_col: number = 1
+
+    if exists('*getwininfo')
+        var wininfo: dict<any> = getwininfo(win_getid())[0]
+        screen_col = wininfo.wincol
+
+        if has_key(wininfo, 'textoff')
+            screen_col += wininfo.textoff
+        endif
+    endif
+
+    var available_cols: number = WindowTextWidth()
+    var window_start: number = line('w0')
+    var window_end: number = line('w$')
+    var lnum: number = FindFigureScanStart(window_start)
+
+    while lnum <= window_end
+        var line_str: string = getline(lnum)
+
+        if IsFigureLine(line_str)
+            var start_lnum: number = lnum + 1
+            var end_lnum: number = FindFigureAreaEnd(lnum)
+            var visible_start: number = max([start_lnum, window_start])
+            var visible_end: number = min([end_lnum, window_end])
+
+            if visible_start <= visible_end
+                ClearTerminalTextArea(visible_start,
+                    visible_end - visible_start + 1,
+                    available_cols, screen_col)
+            endif
+
+            lnum = end_lnum + 1
+            continue
+        endif
+
+        lnum += 1
+    endwhile
+enddef
+
+def ClearExternalImages()
+    var engine: string = GetStringSetting('python_notebook_draw_engine',
+        'chafa')
+    if engine ==# 'ueberzugpp'
+        ClearUeberzugppImages()
+        return
+    endif
+
+    ClearVisibleFigureTextAreas()
+enddef
+
+def ClearWholeTerminalTextArea()
+    var available_cols: number = max([1, &columns])
+    var available_lines: number = max([1, &lines])
+    var clear_spaces: string = repeat(' ', available_cols)
+    var seq: string = "\<Esc>7" .. "\<Esc>[?80l" .. "\<Esc>[0m"
+
+    for row in range(1, available_lines)
+        seq ..= "\<Esc>[" .. row .. ";1H" .. clear_spaces
+    endfor
+
+    seq ..= "\<Esc>[?80h" .. "\<Esc>8"
+
+    if exists('*echoraw')
+        echoraw(seq)
+    else
+        writefile([seq], '/dev/tty', 'b')
+    endif
+enddef
+
+def ClearExternalImagesForLayoutChange()
+    var engine: string = GetStringSetting('python_notebook_draw_engine',
+        'chafa')
+    if engine ==# 'ueberzugpp'
+        ClearUeberzugppImages()
+        return
+    endif
+
+    # During a split/close/resize, the old figure rectangle may no longer
+    # correspond to any current Vim window. Clear the full terminal grid and
+    # let :redraw! repaint Vim's text UI before figures are drawn again.
+    ClearWholeTerminalTextArea()
+enddef
+
+def ClearUeberzugppPreparedImages()
+    for prepared_path in values(ueberzugpp_prepared_cache)
+        if !empty(prepared_path) && filereadable(prepared_path)
+            delete(prepared_path)
+        endif
+    endfor
+
+    ueberzugpp_prepared_cache = {}
+enddef
+
+def StopUeberzugppLayerDaemon()
+    ClearUeberzugppImages()
+    ClearUeberzugppPreparedImages()
+    StopImagePrepWorker()
+
+    if UeberzugppLayerReady()
+        try
+            job_stop(ueberzugpp_job, 'term')
+        catch
+            ueberzugpp_error = 'job_stop() failed: ' .. v:exception
+            echohl ErrorMsg
+            echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+            echohl None
+        endtry
+    endif
+
+    ueberzugpp_job = v:none
+    ueberzugpp_channel = v:none
+    ueberzugpp_pid = 0
+enddef
+
+def UeberzugppPreparedCacheKey(
+    path: string,
+    available_cols: number,
+    available_lines: number,
+    crop_top_lines: number,
+    total_lines: number,
+    output_format: string
+): string
+    return output_format .. ':' .. path .. ':' .. getfsize(path) .. ':'
+        .. getftime(path) .. ':' .. available_cols .. 'x'
+        .. available_lines .. '@' .. crop_top_lines .. '/total='
+        .. total_lines .. ':' .. CellWidth() .. 'x' .. CellHeight()
+enddef
+
+def ImagePrepLayoutKey(path: string,
+                       total_lines: number, available_cols: number): string
+    return path .. ':' .. getfsize(path) .. ':' .. getftime(path)
+        .. ':cols=' .. string(max([1, available_cols]))
+        .. ':lines=' .. string(max([1, total_lines]))
+enddef
+
+def PrepareImageWithWorker(
+    path: string,
+    prepared_path: string,
+    max_pixel_width: number,
+    max_pixel_height: number,
+    crop_top_pixels: number,
+    crop_height_pixels: number,
+    output_format: string,
+    failure_context: string,
+    layout_key: string,
+    cell_width: number,
+    cell_height: number
+): string
+    var response: dict<any> = ImagePrepWorkerRequest({
+        'action': 'prepare',
+        'input_path': path,
+        'output_path': prepared_path,
+        'max_pixel_width': max_pixel_width,
+        'max_pixel_height': max_pixel_height,
+        'crop_top_pixels': crop_top_pixels,
+        'crop_height_pixels': crop_height_pixels,
+        'output_format': output_format,
+        'layout_key': layout_key,
+        'cell_width': cell_width,
+        'cell_height': cell_height,
+    })
+
+    if get(response, 'ok', false)
+        var response_path: string = JsonValueToString(get(response, 'path',
+            prepared_path))
+        if !empty(response_path) && filereadable(response_path)
+            return response_path
+        endif
+
+        ueberzugpp_error = failure_context
+            .. ' worker reported success but output is unreadable: '
+            .. response_path
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        return ''
+    endif
+
+    ueberzugpp_error = failure_context .. ' worker failed; source=' .. path
+        .. '; error=' .. JsonValueToString(get(response, 'error',
+        'unknown error'))
+    echohl ErrorMsg
+    echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+    echohl None
+    return ''
+enddef
+
+def PrepareUeberzugppImage(
+    path: string,
+    available_cols: number,
+    available_lines: number,
+    crop_top_lines: number,
+    total_lines: number
+): string
+    var output_format: string = UeberzugppPreparedOutputFormat()
+
+    # Always prepare through the worker, even for a full RGBA image. The
+    # worker owns the per-image baseline cell size and can therefore rescale
+    # the cached source when the terminal font cell size changes.
+
+    var python_cmd: string = 'python3'
+    var helper_path: string = g:python_notebook_helper
+
+    if empty(python_cmd) || !executable(python_cmd)
+        return path
+    endif
+
+    if empty(helper_path) || !filereadable(helper_path)
+        return path
+    endif
+
+    var current_cell_width: number = CellWidth()
+    var current_cell_height: number = CellHeight()
+    var layout_key: string = ImagePrepLayoutKey(path, total_lines,
+        available_cols)
+    var cache_key: string = UeberzugppPreparedCacheKey(path, available_cols,
+        available_lines, crop_top_lines, total_lines, output_format)
+    if has_key(ueberzugpp_prepared_cache, cache_key)
+            && filereadable(ueberzugpp_prepared_cache[cache_key])
+        return ueberzugpp_prepared_cache[cache_key]
+    endif
+
+    var max_pixel_width: number = max([1,
+        available_cols * current_cell_width])
+    var max_pixel_height: number = max([1,
+        total_lines * current_cell_height])
+    var crop_top_pixels: number = max([0,
+        crop_top_lines * current_cell_height])
+    var crop_height_pixels: number = max([1,
+        available_lines * current_cell_height])
+    var prepared_path: string = tempname() .. '.png'
+
+    var worker_path: string = PrepareImageWithWorker(path, prepared_path,
+        max_pixel_width, max_pixel_height, crop_top_pixels,
+        crop_height_pixels, output_format, 'ueberzugpp image prep',
+        layout_key, current_cell_width, current_cell_height)
+    if !empty(worker_path)
+        ueberzugpp_prepared_cache[cache_key] = worker_path
+        return worker_path
+    endif
+
+    return path
+enddef
+
+def ClearTerminalTextArea(
+    visible_start: number,
+    visible_lines: number,
+    available_cols: number,
+    screen_col: number
+)
+    var absolute_row: number = screenpos(win_getid(), visible_start, 1).row
+    if absolute_row <= 0
+        return
+    endif
+
+    var clear_spaces: string = repeat(' ', available_cols)
+    var seq: string = "\<Esc>7" .. "\<Esc>[?80l" .. "\<Esc>[0m"
+
+    for i in range(0, visible_lines - 1)
+        seq ..= "\<Esc>[" .. (absolute_row + i) .. ";" .. screen_col
+            .. "H" .. clear_spaces
+    endfor
+
+    seq ..= "\<Esc>[?80h" .. "\<Esc>8"
+
+    if exists('*echoraw')
+        echoraw(seq)
+    else
+        writefile([seq], '/dev/tty', 'b')
+    endif
+enddef
+
+def DrawFigureAtWithUeberzugpp(
+    path: string,
+    start_lnum: number,
+    end_lnum: number,
+    visible_start: number,
+    visible_lines: number,
+    screen_col: number,
+    available_cols: number
+)
+    if !UeberzugppLayerReady()
+        StartUeberzugppLayerDaemon()
+    endif
+
+    if !UeberzugppLayerReady()
+        ueberzugpp_error = 'draw skipped because layer is not ready;'
+            .. 'job status=' .. UeberzugppJobStatus()
+            .. ', channel status=' .. UeberzugppChannelStatus()
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        DrawGapText(visible_start, visible_lines, available_cols, screen_col,
+            '[ueberzugpp layer daemon is not ready]')
+        return
+    endif
+
+    var absolute_row: number = screenpos(win_getid(), visible_start, 1).row
+    if absolute_row <= 0
+        return
+    endif
+
+    var crop_top_lines: number = visible_start - start_lnum
+    var total_lines: number = end_lnum - start_lnum + 1
+    var display_path: string = PrepareUeberzugppImage(path, available_cols,
+        visible_lines, crop_top_lines, total_lines)
+
+    if !filereadable(display_path)
+        ueberzugpp_error = 'draw skipped because prepared image is not readable; '
+            .. 'original=' .. path .. '; prepared=' .. display_path
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        DrawGapText(visible_start, visible_lines, available_cols, screen_col,
+            '[ueberzugpp prepared image not readable]')
+        return
+    endif
+
+    var file_id: string = substitute(fnamemodify(path, ':t'), '\W', '_', 'g')
+    var identifier: string = 'notebook-python-vim-' .. getpid() .. '-'
+        .. win_getid() .. '-' .. file_id
+
+    ueberzugpp_current_cycle_ids[identifier] = true
+
+    ClearTerminalTextArea(visible_start, visible_lines, available_cols,
+        screen_col)
+
+    if UeberzugppSendJson({
+            'action': 'add',
+            'identifier': identifier,
+            'path': display_path,
+            'x': max([0, screen_col - 1]),
+            'y': max([0, absolute_row - 1]),
+            'max_width': available_cols,
+            'max_height': visible_lines,
+        })
+        ueberzugpp_visible_image_ids[identifier] = true
+    else
+        ueberzugpp_error = 'add command failed for '
+            .. 'identifier=' .. identifier
+            .. '; path=' .. display_path
+        echohl ErrorMsg
+        echomsg 'notebook-python.vim: ueberzugpp: ' .. ueberzugpp_error
+        echohl None
+        DrawGapText(visible_start, visible_lines, available_cols, screen_col,
+            '[could not render figure with ueberzugpp]')
+    endif
+enddef
+
+def DrawGapText(
+    visible_start: number,
+    visible_lines: number,
+    available_cols: number,
+    screen_col: number,
+    message: string
+)
+    var absolute_row: number = screenpos(win_getid(), visible_start, 1).row
+    if absolute_row <= 0
+        return
+    endif
+
+    var target_row: number = absolute_row
+    var clear_spaces: string = repeat(' ', available_cols)
+
+    var clipped_message: string = message
+    if strdisplaywidth(clipped_message) > available_cols
+        clipped_message = strpart(clipped_message, 0,
+            max([0, available_cols - 1]))
+    endif
+
+    var seq: string = "\<Esc>7" .. "\<Esc>[?80l" .. "\<Esc>[0m"
+
+    for i in range(0, visible_lines - 1)
+        seq ..= "\<Esc>[" .. (target_row + i) .. ";" .. screen_col
+            .. "H" .. clear_spaces
+    endfor
+
+    seq ..= "\<Esc>[" .. target_row .. ";" .. screen_col .. "H" .. "\<Esc>[31m"
+        .. clipped_message .. "\<Esc>[0m"
+    seq ..= "\<Esc>[?80h" .. "\<Esc>8"
+
+    if exists('*echoraw')
+        echoraw(seq)
+    else
+        writefile([seq], '/dev/tty', 'b')
+    endif
+enddef
+
+def DrawFigureAt(
+    path: string,
+    start_lnum: number,
+    end_lnum: number,
+    screen_col: number,
+    available_cols: number
+)
+    var window_start: number = line('w0')
+    var window_end: number = line('w$')
+
+    var visible_start: number = max([start_lnum, window_start])
+    var visible_end: number = min([end_lnum, window_end])
+
+    if visible_start > visible_end
+        return
+    endif
+
+    var visible_lines: number = visible_end - visible_start + 1
+    if visible_lines <= 0
+        return
+    endif
+
+    if !filereadable(path)
+        DrawGapText(visible_start, visible_lines, available_cols, screen_col,
+            '[figure not found: ' .. path .. ']')
+        return
+    endif
+
+    var engine: string = GetStringSetting('python_notebook_draw_engine',
+        'chafa')
+    if engine ==# 'ueberzugpp'
+        DrawFigureAtWithUeberzugpp(path, start_lnum, end_lnum, visible_start,
+            visible_lines, screen_col, available_cols)
+        return
+    endif
+
+    var crop_top_lines: number = visible_start - start_lnum
+    var total_lines: number = end_lnum - start_lnum + 1
+    var sixel_data: string = GenerateFigureSixel(path, available_cols,
+        visible_lines, crop_top_lines, total_lines)
+    if empty(sixel_data)
+        DrawGapText(visible_start, visible_lines, available_cols, screen_col,
+            '[could not render figure as sixel]')
+        return
+    endif
+
+    var absolute_row: number = screenpos(win_getid(), visible_start, 1).row
+    if absolute_row <= 0
+        return
+    endif
+
+    var target_row: number = absolute_row
+    var clear_spaces: string = repeat(' ', available_cols)
+
+    var seq: string = "\<Esc>7" .. "\<Esc>[?80l" .. "\<Esc>[0m"
+
+    for i in range(0, visible_lines - 1)
+        seq ..= "\<Esc>[" .. (target_row + i) .. ";" .. screen_col
+            .. "H" .. clear_spaces
+    endfor
+
+    seq ..= "\<Esc>[" .. target_row .. ";" .. screen_col .. "H" .. sixel_data
+    seq ..= "\<Esc>[?80h" .. "\<Esc>8"
+
+    if exists('*echoraw')
+        echoraw(seq)
+    else
+        writefile([seq], '/dev/tty', 'b')
+    endif
+enddef
+
+def FindFigureScanStart(window_start: number): number
+    var lnum: number = window_start
+
+    while lnum >= 1
+        var line_str: string = getline(lnum)
+
+        if IsFigureLine(line_str)
+            return lnum
+        endif
+
+        if IsGeneratedStart(line_str)
+            return lnum
+        endif
+
+        lnum -= 1
+    endwhile
+
+    return 1
+enddef
+
+def DrawOtherVisibleNotebookWindows(current_winid: number)
+    if !exists('*getwininfo') || !exists('*win_execute')
+        return
+    endif
+
+    for wininfo in getwininfo()
+        var tabnr_value: number = str2nr(string(
+            get(wininfo, 'tabnr', tabpagenr())))
+        if tabnr_value != tabpagenr()
+            continue
+        endif
+
+        var winid_value: number = str2nr(string(get(wininfo, 'winid', 0)))
+        var bufnr_value: number = str2nr(string(get(wininfo, 'bufnr', 0)))
+
+        if winid_value <= 0 || winid_value == current_winid || bufnr_value <= 0
+            continue
+        endif
+
+        if getbufvar(bufnr_value, 'python_notebook_active', 0) == 0
+            continue
+        endif
+
+        try
+            win_execute(winid_value,
+                'call ' .. script_sid .. 'DrawNotebookFigures(false)')
+        catch
+        endtry
+    endfor
+enddef
+
+def DrawNotebookFigures(remove_stale: bool = true)
+    if !exists('b:python_notebook_active')
+        return
+    endif
+
+    var engine: string = GetStringSetting('python_notebook_draw_engine',
+        'chafa')
+    var should_remove_stale: bool = (engine ==# 'ueberzugpp') && remove_stale
+
+    if should_remove_stale
+        ueberzugpp_current_cycle_ids = {}
+    endif
+
+    var current_winid: number = win_getid()
+    var screen_col: number = 1
+
+    if exists('*getwininfo')
+        var wininfo: dict<any> = getwininfo(current_winid)[0]
+        screen_col = wininfo.wincol
+
+        if has_key(wininfo, 'textoff')
+            screen_col += wininfo.textoff
+        endif
+    endif
+
+    var available_cols: number = WindowTextWidth()
+    var window_start: number = line('w0')
+    var window_end: number = line('w$')
+    var lnum: number = FindFigureScanStart(window_start)
+
+    while lnum <= window_end
+        var line_str: string = getline(lnum)
+
+        if IsFigureLine(line_str)
+            var path: string = FigurePathFromLine(line_str)
+            var start_lnum: number = lnum + 1
+            var end_lnum: number = FindFigureAreaEnd(lnum)
+
+            if start_lnum <= end_lnum
+                DrawFigureAt(path, start_lnum, end_lnum, screen_col,
+                    available_cols)
+            endif
+
+            lnum = end_lnum + 1
+            continue
+        endif
+
+        lnum += 1
+    endwhile
+
+    if should_remove_stale
+        # A single focused-window redraw must not treat images from other
+        # visible notebook splits as stale. Draw the other visible notebook
+        # windows into the same collection cycle first, then prune once.
+        DrawOtherVisibleNotebookWindows(current_winid)
+
+        for identifier in keys(ueberzugpp_visible_image_ids)
+            if !has_key(ueberzugpp_current_cycle_ids, identifier)
+                UeberzugppRemoveImage(identifier)
+                remove(ueberzugpp_visible_image_ids, identifier)
+            endif
+        endfor
+    endif
+enddef
+
+def DrawNotebookFiguresAfterTerminalRedraw()
+    var engine: string = GetStringSetting('python_notebook_draw_engine',
+        'chafa')
+
+    if engine ==# 'ueberzugpp'
+        DrawNotebookFigures()
+        return
+    endif
+
+    # Sixel output is part of the terminal grid, not a per-window overlay.
+    # Any Vim redraw triggered by scrolling one split can erase images in every
+    # split. Repaint all visible notebook windows so the inactive splits do not
+    # stay blank until they are focused again.
+    DrawNotebookFiguresInVisibleWindows()
+enddef
+
+def DrawNotebookFiguresTimer(timer_id: number)
+    if figure_draw_timer == timer_id
+        figure_draw_timer = -1
+    endif
+
+    DrawNotebookFiguresAfterTerminalRedraw()
+enddef
+
+def AnyVisibleNotebookBuffer(): bool
+    if !exists('*getwininfo')
+        return exists('b:python_notebook_active')
+    endif
+
+    for wininfo in getwininfo()
+        var tabnr_value: number = str2nr(string(
+            get(wininfo, 'tabnr', tabpagenr())))
+        if tabnr_value != tabpagenr()
+            continue
+        endif
+
+        var bufnr_value: number = str2nr(string(get(wininfo, 'bufnr', 0)))
+        if bufnr_value > 0
+                && getbufvar(bufnr_value, 'python_notebook_active', 0) != 0
+            return true
+        endif
+    endfor
+
+    return false
+enddef
+
+def NotebookWindowLayoutSignature(): string
+    if !exists('*getwininfo')
+        return string(tabpagenr()) .. ':' .. string(winnr('$')) .. ':'
+            .. string(winwidth(0)) .. 'x' .. string(winheight(0))
+    endif
+
+    var parts: list<string> = []
+
+    for wininfo in getwininfo()
+        var tabnr_value: number = str2nr(string(
+            get(wininfo, 'tabnr', tabpagenr())))
+        if tabnr_value != tabpagenr()
+            continue
+        endif
+
+        add(parts, join([
+            string(get(wininfo, 'winid', 0)),
+            string(get(wininfo, 'winrow', 0)),
+            string(get(wininfo, 'wincol', 0)),
+            string(get(wininfo, 'width', 0)),
+            string(get(wininfo, 'height', 0)),
+            string(get(wininfo, 'textoff', 0)),
+        ], ','))
+    endfor
+
+    return string(tabpagenr()) .. ':' .. join(parts, ';')
+enddef
+
+def DrawNotebookFiguresInVisibleWindows()
+    if !exists('*getwininfo') || !exists('*win_execute')
+        DrawNotebookFigures(false)
+        return
+    endif
+
+    for wininfo in getwininfo()
+        var tabnr_value: number = str2nr(string(
+            get(wininfo, 'tabnr', tabpagenr())))
+        if tabnr_value != tabpagenr()
+            continue
+        endif
+
+        var winid_value: number = str2nr(string(get(wininfo, 'winid', 0)))
+        var bufnr_value: number = str2nr(string(get(wininfo, 'bufnr', 0)))
+
+        if winid_value <= 0 || bufnr_value <= 0
+            continue
+        endif
+
+        if getbufvar(bufnr_value, 'python_notebook_active', 0) == 0
+            continue
+        endif
+
+        try
+            win_execute(winid_value,
+                'call ' .. script_sid .. 'DrawNotebookFigures(false)')
+        catch
+        endtry
+    endfor
+enddef
+
+def NotebookLayoutRedrawTimer(timer_id: number)
+    if notebook_layout_redraw_timer == timer_id
+        notebook_layout_redraw_timer = -1
+    endif
+
+    notebook_layout_signature = NotebookWindowLayoutSignature()
+
+    if !AnyVisibleNotebookBuffer()
+        return
+    endif
+
+    StopNotebookFigureDrawTimer()
+    ClearExternalImagesForLayoutChange()
+    redraw!
+    DrawNotebookFiguresInVisibleWindows()
+enddef
+
+def StopNotebookLayoutRedrawTimer()
+    if notebook_layout_redraw_timer != -1
+        try
+            timer_stop(notebook_layout_redraw_timer)
+        catch
+        endtry
+
+        notebook_layout_redraw_timer = -1
+    endif
+enddef
+
+def ScheduleNotebookLayoutRedraw(force: bool = false, delay_ms: number = 50)
+    var signature: string = NotebookWindowLayoutSignature()
+
+    if !AnyVisibleNotebookBuffer()
+        notebook_layout_signature = signature
+        return
+    endif
+
+    if !force && !empty(notebook_layout_signature)
+            && signature ==# notebook_layout_signature
+        return
+    endif
+
+    notebook_layout_signature = signature
+    StopNotebookLayoutRedrawTimer()
+    notebook_layout_redraw_timer = timer_start(max([0, delay_ms]),
+        NotebookLayoutRedrawTimer)
+enddef
+
+def StopNotebookFigureDrawTimer()
+    if figure_draw_timer != -1
+        try
+            timer_stop(figure_draw_timer)
+        catch
+        endtry
+
+        figure_draw_timer = -1
+    endif
+enddef
+
+def ScheduleNotebookFigureDraw(delay_ms: number = 50)
+    StopNotebookFigureDrawTimer()
+    figure_draw_timer = timer_start(max([0, delay_ms]),
+                                    DrawNotebookFiguresTimer)
+enddef
+
+def NotebookScrollRedraw()
+    ClearExternalImages()
+    redraw!
+    DrawNotebookFiguresAfterTerminalRedraw()
+enddef
+
+def NotebookRedraw()
+    ClearExternalImages()
+    redraw!
+    ScheduleNotebookFigureDraw()
+enddef
+
+def NotebookWindowLeave()
+    StopNotebookFigureDrawTimer()
+    ClearExternalImages()
+    redraw!
+enddef
+
+
+def BuildNotebookStatusBlock(
+    request_id: string,
+    cell_index: number,
+    state: string
+): list<string>
+    var clean_id: string = StripNullBytes(request_id)
+    var clean_state: string = StripNullBytes(state)
+    if clean_state !=# 'queued' && clean_state !=# 'running'
+        clean_state = 'running'
+    endif
+
+    return [
+        status_start_marker_prefix .. ' [' .. clean_state .. '] id=' .. clean_id
+            .. ' cell=' .. string(cell_index),
+        '# ' .. clean_state .. '...',
+        status_end_marker,
+    ]
+enddef
+
+def BuildRunningStatusBlock(request_id: string, cell_index: number): list<string>
+    return BuildNotebookStatusBlock(request_id, cell_index, 'running')
+enddef
+
+def InsertNotebookRunningStatuses(
+    cells: list<dict<any>>,
+    cell_indices: list<number>,
+    request_id: string,
+    state: string = 'running'
+)
+    var inserts: list<dict<any>> = []
+
+    for cell_index in cell_indices
+        if cell_index < 0 || cell_index >= len(cells)
+            continue
+        endif
+
+        var cell: dict<any> = cells[cell_index]
+        add(inserts, {
+            'lnum': str2nr(string(get(cell, 'insert_after', line('$')))),
+            'lines': BuildNotebookStatusBlock(request_id, cell_index, state),
+        })
+    endfor
+
+    sort(inserts, (a, b) => get(b, 'lnum', 0) - get(a, 'lnum', 0))
+
+    for insert in inserts
+        append(get(insert, 'lnum', line('$')), get(insert, 'lines', []))
+    endfor
+enddef
+
+def ClearNotebookStatusBlocksForRequest(request_id: string)
+    var clean_id: string = StripNullBytes(request_id)
+    if empty(clean_id)
+        return
+    endif
+
+    var lnum: number = 1
+    while lnum <= line('$')
+        var line_str: string = getline(lnum)
+        if IsStatusStart(line_str) && stridx(line_str, 'id=' .. clean_id) >= 0
+            var status_end: number = FindGeneratedEnd(lnum)
+            if status_end > 0
+                deletebufline(bufnr('%'), lnum, status_end)
+            else
+                deletebufline(bufnr('%'), lnum)
+            endif
+            continue
+        endif
+
+        lnum += 1
+    endwhile
+enddef
+
+def ClearNotebookStatusBlockForRequestCell(request_id: string, cell_index: number)
+    while ReplaceNotebookStatusBlockForRequestCell(request_id, cell_index, [])
+    endwhile
+enddef
+
+def NotebookStatusLineMatchesRequestCell(
+    line_str: string,
+    request_id: string,
+    cell_index: number
+): bool
+    if !IsStatusStart(line_str)
+        return false
+    endif
+
+    var clean_id: string = StripNullBytes(request_id)
+    if empty(clean_id)
+        return false
+    endif
+
+    var line_cell_text: string = matchstr(line_str, '\<cell=\zs\d\+')
+    if empty(line_cell_text)
+        return false
+    endif
+
+    return stridx(line_str, 'id=' .. clean_id) >= 0
+        && str2nr(line_cell_text) == cell_index
+enddef
+
+def FindNotebookStatusBlockForRequestCell(
+    request_id: string,
+    cell_index: number
+): dict<number>
+    var lnum: number = 1
+    while lnum <= line('$')
+        var line_str: string = getline(lnum)
+        if NotebookStatusLineMatchesRequestCell(line_str, request_id, cell_index)
+            var status_end: number = FindGeneratedEnd(lnum)
+            if status_end <= 0
+                status_end = lnum
+            endif
+
+            return {'start': lnum, 'end': status_end}
+        endif
+
+        lnum += 1
+    endwhile
+
+    return {'start': 0, 'end': 0}
+enddef
+
+def ReplaceNotebookStatusBlockForRequestCell(
+    request_id: string,
+    cell_index: number,
+    replacement_lines: list<string>
+): bool
+    var block: dict<number> = FindNotebookStatusBlockForRequestCell(
+        request_id, cell_index)
+    var start_lnum: number = get(block, 'start', 0)
+    if start_lnum <= 0
+        return false
+    endif
+
+    var end_lnum: number = get(block, 'end', start_lnum)
+    var insert_after: number = start_lnum - 1
+
+    deletebufline(bufnr('%'), start_lnum, end_lnum)
+    if !empty(replacement_lines)
+        append(insert_after, replacement_lines)
+    endif
+
+    return true
+enddef
+
+def SetNotebookStatusForRequestCell(
+    request_id: string,
+    cell_index: number,
+    state: string
+)
+    if ReplaceNotebookStatusBlockForRequestCell(
+            request_id, cell_index,
+            BuildNotebookStatusBlock(request_id, cell_index, state))
+        return
+    endif
+
+    var cells: list<dict<any>> = ParseNotebookCells()
+    InsertNotebookRunningStatuses(cells, [cell_index], request_id, state)
+enddef
+
+def NotebookResultBlockForStatusAnchor(result: dict<any>): list<string>
+    var block: list<string> = []
+
+    var output_block: list<string> = BuildOutputBlock(result)
+    if !empty(output_block)
+        extend(block, output_block)
+    endif
+
+    var error_block: list<string> = BuildErrorBlock(result)
+    if !empty(error_block)
+        extend(block, error_block)
+    endif
+
+    return block
+enddef
+
+def InsertNotebookResults(cells: list<dict<any>>, results: list<any>): bool
+    var inserts: list<dict<any>> = []
+    var has_error: bool = false
+
+    for raw_result in results
+        var result: dict<any> = raw_result
+        var cell_index: number = str2nr(string(get(result, 'index', 0)))
+
+        if cell_index < 0 || cell_index >= len(cells)
+            continue
+        endif
+
+        var cell: dict<any> = cells[cell_index]
+
+        var output_block: list<string> = BuildOutputBlock(result)
+        if !empty(output_block)
+            add(inserts, {
+                'lnum': OutputInsertLineForResult(cell, result),
+                'lines': output_block,
+            })
+        endif
+
+        var error_block: list<string> = BuildErrorBlock(result)
+        if !empty(error_block)
+            has_error = true
+            var error_line: number = str2nr(string(
+                get(result, 'error_line', 0)))
+            var error_lnum: number = str2nr(string(
+                get(cell, 'insert_after', line('$'))))
+
+            if error_line > 0
+                error_lnum = CellLineToBufferLine(cell, error_line)
+            endif
+
+            add(inserts, {
+                'lnum': error_lnum,
+                'lines': error_block,
+            })
+        endif
+    endfor
+
+    sort(inserts, (a, b) => get(b, 'lnum', 0) - get(a, 'lnum', 0))
+
+    for insert in inserts
+        append(get(insert, 'lnum', line('$')), get(insert, 'lines', []))
+    endfor
+
+    return has_error
+enddef
+
+def InsertNotebookResultsAtStatusAnchors(
+    request_id: string,
+    cells: list<dict<any>>,
+    results: list<any>
+): bool
+    var fallback_results: list<any> = []
+    var has_error: bool = false
+
+    for raw_result in results
+        if type(raw_result) != v:t_dict
+            continue
+        endif
+
+        var result: dict<any> = raw_result
+        var cell_index: number = str2nr(string(get(result, 'index', -1)))
+        if cell_index < 0
+            continue
+        endif
+
+        if !empty(BuildErrorBlock(result))
+            has_error = true
+        endif
+
+        var replacement: list<string> = NotebookResultBlockForStatusAnchor(
+            result)
+        if ReplaceNotebookStatusBlockForRequestCell(
+                request_id, cell_index, replacement)
+            continue
+        endif
+
+        add(fallback_results, result)
+    endfor
+
+    if !empty(fallback_results)
+        if InsertNotebookResults(cells, fallback_results)
+            has_error = true
+        endif
+    endif
+
+    return has_error
+enddef
+
+def FindNotebookCellIndexForLine(cells: list<dict<any>>, target_lnum: number): number
+    if empty(cells)
+        return -1
+    endif
+
+    var fallback_index: number = 0
+
+    for i in range(0, len(cells) - 1)
+        var cell: dict<any> = cells[i]
+        var marker_lnum: number = str2nr(string(get(cell, 'marker_lnum', 0)))
+        var code_start: number = str2nr(string(get(cell, 'code_start', 1)))
+        var code_end: number = str2nr(string(get(cell, 'code_end', code_start)))
+        var start_lnum: number = code_start
+
+        if marker_lnum > 0
+            start_lnum = marker_lnum
+        endif
+
+        if target_lnum >= start_lnum
+            fallback_index = i
+        endif
+
+        if target_lnum >= start_lnum && target_lnum <= code_end
+            return i
+        endif
+    endfor
+
+    return fallback_index
+enddef
+
+def FindNotebookCellIndexByMarker(cells: list<dict<any>>, marker_lnum: number): number
+    if marker_lnum <= 0
+        return -1
+    endif
+
+    for i in range(0, len(cells) - 1)
+        var cell: dict<any> = cells[i]
+        if str2nr(string(get(cell, 'marker_lnum', 0))) == marker_lnum
+            return i
+        endif
+    endfor
+
+    return -1
+enddef
+
+def ClearGeneratedBlocksInRange(start_lnum: number, end_lnum: number)
+    var lnum: number = max([1, start_lnum])
+    var last_lnum: number = min([line('$'), end_lnum])
+
+    while lnum <= last_lnum
+        if IsGeneratedStart(getline(lnum))
+            var generated_end: number = FindGeneratedEnd(lnum)
+            if generated_end > 0
+                var deleted_count: number = generated_end - lnum + 1
+                deletebufline(bufnr('%'), lnum, generated_end)
+                last_lnum -= deleted_count
+            else
+                deletebufline(bufnr('%'), lnum)
+                last_lnum -= 1
+            endif
+            continue
+        endif
+
+        lnum += 1
+    endwhile
+enddef
+
+def ClearGeneratedBlocksForCell(cell: dict<any>)
+    ClearExternalImages()
+    ClearNotebookMatches()
+    ClearGeneratedBlocksInRange(
+        str2nr(string(get(cell, 'code_start', 1))),
+        str2nr(string(get(cell, 'code_end', line('$')))))
+enddef
+
+def NotebookKernelRemovePendingRequest(request_id: string, bufnr_value: number)
+    if has_key(notebook_kernel_pending_requests, request_id)
+        remove(notebook_kernel_pending_requests, request_id)
+    endif
+
+    if has_key(notebook_kernel_ready_responses, request_id)
+        remove(notebook_kernel_ready_responses, request_id)
+    endif
+
+    var bufnr_key: string = string(bufnr_value)
+    if has_key(notebook_kernel_pending_by_bufnr, bufnr_key)
+            && notebook_kernel_pending_by_bufnr[bufnr_key] ==# request_id
+        remove(notebook_kernel_pending_by_bufnr, bufnr_key)
+    endif
+enddef
+
+def NotebookKernelTakeReadyResponse(request_id: string): any
+    if !has_key(notebook_kernel_ready_responses, request_id)
+        return v:none
+    endif
+
+    var queued: any = notebook_kernel_ready_responses[request_id]
+    if type(queued) == v:t_list
+        if empty(queued)
+            remove(notebook_kernel_ready_responses, request_id)
+            return v:none
+        endif
+
+        var response: any = remove(queued, 0)
+        if empty(queued)
+            remove(notebook_kernel_ready_responses, request_id)
+        else
+            notebook_kernel_ready_responses[request_id] = queued
+        endif
+        return response
+    endif
+
+    remove(notebook_kernel_ready_responses, request_id)
+    return queued
+enddef
+
+def NotebookKernelClearStatusForResults(request_id: string, results: list<any>)
+    for raw_result in results
+        if type(raw_result) != v:t_dict
+            continue
+        endif
+
+        var result: dict<any> = raw_result
+        var cell_index: number = str2nr(string(get(result, 'index', -1)))
+        if cell_index >= 0
+            ClearNotebookStatusBlockForRequestCell(request_id, cell_index)
+        endif
+    endfor
+enddef
+
+def FinishNotebookKernelRequest(request_id: string)
+    if !has_key(notebook_kernel_pending_requests, request_id)
+        if has_key(notebook_kernel_ready_responses, request_id)
+            remove(notebook_kernel_ready_responses, request_id)
+        endif
+        return
+    endif
+
+    var response_any: any = NotebookKernelTakeReadyResponse(request_id)
+    if type(response_any) != v:t_dict
+        return
+    endif
+
+    var pending: dict<any> = notebook_kernel_pending_requests[request_id]
+    var response: dict<any> = response_any
+    var bufnr_value: number = str2nr(string(get(pending, 'bufnr', 0)))
+
+    if bufnr_value <= 0 || bufnr('%') != bufnr_value
+        notebook_kernel_ready_responses[request_id] = [response]
+        return
+    endif
+
+    var was_modifiable: bool = &l:modifiable
+    if !was_modifiable
+        setlocal modifiable
+    endif
+
+    try
+        var response_done: bool = get(response, 'done', true)
+        var action: string = JsonValueToString(get(pending, 'action', ''))
+
+        if get(pending, 'discard_results', false)
+            if response_done
+                ClearNotebookStatusBlocksForRequest(request_id)
+                NotebookKernelRemovePendingRequest(request_id, bufnr_value)
+                RefreshNotebookMatches()
+                NotebookRedraw()
+            endif
+            return
+        endif
+
+        if !get(response, 'ok', false)
+            ClearNotebookStatusBlocksForRequest(request_id)
+            NotebookKernelRemovePendingRequest(request_id, bufnr_value)
+            RefreshNotebookMatches()
+            NotebookRedraw()
+            echohl ErrorMsg
+            echomsg 'notebook-python.vim: kernel failed: '
+                .. JsonValueToString(get(response, 'error', 'unknown error'))
+            echohl None
+            return
+        endif
+
+        var status_state: string = JsonValueToString(get(response, 'status', ''))
+        if !empty(status_state)
+            var status_cell_index: number = str2nr(string(
+                get(response, 'cell_index', -1)))
+            if status_cell_index >= 0
+                SetNotebookStatusForRequestCell(
+                    request_id, status_cell_index, status_state)
+            endif
+
+            if response_done
+                ClearNotebookStatusBlocksForRequest(request_id)
+                NotebookKernelRemovePendingRequest(request_id, bufnr_value)
+            else
+                notebook_kernel_pending_requests[request_id] = pending
+            endif
+
+            RefreshNotebookMatches()
+            NotebookRedraw()
+            return
+        endif
+
+        var results: list<any> = get(response, 'results', [])
+
+        # Prefer the generated status block as the insertion anchor.  This
+        # keeps asynchronous results attached to the cell that started them,
+        # even when the user edits text above or inside other cells while the
+        # kernel is still running.  If the user manually deletes a status block,
+        # fall back to the current parsed cell index.
+        var cells: list<dict<any>> = ParseNotebookCells()
+        var has_error: bool = InsertNotebookResultsAtStatusAnchors(
+            request_id, cells, results)
+
+        if response_done
+            ClearNotebookStatusBlocksForRequest(request_id)
+            NotebookKernelRemovePendingRequest(request_id, bufnr_value)
+        else
+            notebook_kernel_pending_requests[request_id] = pending
+        endif
+
+        RefreshNotebookMatches()
+        NotebookRedraw()
+
+        if get(pending, 'jump_to_error', false) && has_error
+            JumpToFirstNotebookError()
+        endif
+    finally
+        if !was_modifiable
+            setlocal nomodifiable
+        endif
+    endtry
+enddef
+
+def FinishPendingNotebookKernelResponsesForCurrentBuffer()
+    var bufnr_value: number = bufnr('%')
+    var request_ids: list<string> = keys(notebook_kernel_ready_responses)
+
+    for request_id in request_ids
+        if !has_key(notebook_kernel_pending_requests, request_id)
+            remove(notebook_kernel_ready_responses, request_id)
+            continue
+        endif
+
+        var pending: dict<any> = notebook_kernel_pending_requests[request_id]
+        if str2nr(string(get(pending, 'bufnr', 0))) == bufnr_value
+            while has_key(notebook_kernel_ready_responses, request_id)
+                    && has_key(notebook_kernel_pending_requests, request_id)
+                FinishNotebookKernelRequest(request_id)
+            endwhile
+        endif
+    endfor
+enddef
+
+def RunPythonNotebookCurrentCell()
+    var was_modifiable: bool = &l:modifiable
+    if !was_modifiable
+        setlocal modifiable
+    endif
+
+    try
+        var cells: list<dict<any>> = ParseNotebookCells()
+        var cell_index: number = FindNotebookCellIndexForLine(cells, line('.'))
+
+        if cell_index < 0 || cell_index >= len(cells)
+            echohl ErrorMsg
+            echomsg 'notebook-python.vim: no notebook cell found at cursor'
+            echohl None
+            return
+        endif
+
+        var original_cell: dict<any> = cells[cell_index]
+        var marker_lnum: number = str2nr(string(
+            get(original_cell, 'marker_lnum', 0)))
+
+        ClearGeneratedBlocksForCell(original_cell)
+
+        cells = ParseNotebookCells()
+        if marker_lnum > 0
+            var marker_index: number = FindNotebookCellIndexByMarker(
+                cells, marker_lnum)
+            if marker_index >= 0
+                cell_index = marker_index
+            endif
+        elseif cell_index >= len(cells)
+            cell_index = len(cells) - 1
+        endif
+
+        if cell_index < 0 || cell_index >= len(cells)
+            echohl ErrorMsg
+            echomsg 'notebook-python.vim: target cell disappeared after clearing outputs'
+            echohl None
+            return
+        endif
+
+        var cell: dict<any> = cells[cell_index]
+        var request_id: string = NotebookKernelNewRequestId(bufnr('%'))
+        InsertNotebookRunningStatuses(cells, [cell_index], request_id)
+        var status_block: dict<number> = FindNotebookStatusBlockForRequestCell(
+            request_id, cell_index)
+        var status_lnum: number = get(status_block, 'start', 0)
+        if status_lnum > 0
+            cursor(status_lnum, 1)
+            silent! normal! zz
+        endif
+        RefreshNotebookMatches()
+        redraw
+
+        var pending: dict<any> = {
+            'id': request_id,
+            'action': 'run_cell',
+            'cells': cells,
+            'cell_index': cell_index,
+            'jump_to_error': false,
+        }
+
+        var sent: bool = NotebookKernelSendAsync({
+            'id': request_id,
+            'action': 'run_cell',
+            'buffer_path': StripNullBytes(expand('%:p')),
+            'figure_dir': StripNullBytes(NotebookFigureDir()),
+            'cell': cell,
+        }, pending)
+
+        if sent
+            echomsg 'notebook-python.vim: cell execution started'
+        else
+            ClearNotebookStatusBlocksForRequest(request_id)
+            RefreshNotebookMatches()
+        endif
+    finally
+        if !was_modifiable
+            setlocal nomodifiable
+        endif
+    endtry
+enddef
+
+def RunPythonNotebookFromScratch()
+    var was_modifiable: bool = &l:modifiable
+    if !was_modifiable
+        setlocal modifiable
+    endif
+
+    try
+        StopNotebookKernel()
+        ClearNotebookOutputs()
+
+        var cells: list<dict<any>> = ParseNotebookCells()
+        var all_indices: list<number> = []
+        if !empty(cells)
+            for i in range(0, len(cells) - 1)
+                add(all_indices, i)
+            endfor
+        endif
+
+        var request_id: string = NotebookKernelNewRequestId(bufnr('%'))
+        InsertNotebookRunningStatuses(cells, all_indices, request_id, 'queued')
+        RefreshNotebookMatches()
+        redraw
+
+        var pending: dict<any> = {
+            'id': request_id,
+            'action': 'run_all',
+            'cells': cells,
+            'jump_to_error': true,
+        }
+
+        var sent: bool = NotebookKernelSendAsync({
+            'id': request_id,
+            'action': 'run_all',
+            'buffer_path': StripNullBytes(expand('%:p')),
+            'figure_dir': StripNullBytes(NotebookFigureDir()),
+            'stop_on_error': get(g:, 'python_notebook_stop_on_error', 1) != 0,
+            'cells': cells,
+        }, pending)
+
+        if sent
+            echomsg 'notebook-python.vim: run-all execution started'
+        else
+            ClearNotebookStatusBlocksForRequest(request_id)
+            RefreshNotebookMatches()
+        endif
+    finally
+        if !was_modifiable
+            setlocal nomodifiable
+        endif
+    endtry
+enddef
+
+def SetupNotebookSyntax()
+    silent! syntax clear PythonNotebookOutput
+    silent! syntax clear PythonNotebookError
+    silent! syntax clear PythonNotebookStdout
+    silent! syntax clear PythonNotebookResult
+    silent! syntax clear PythonNotebookFigure
+    silent! syntax clear PythonNotebookStatus
+
+    execute 'syntax region PythonNotebookOutput '
+        .. 'start=/^\s*#\s*nb-output\s*:\s*start.*$/ '
+        .. 'end=/^\s*#\s*nb-output\s*:\s*end\s*$/ '
+        .. 'keepend containedin=ALL'
+    execute 'syntax region PythonNotebookError '
+        .. 'start=/^\s*#\s*nb-error\s*:\s*start.*$/ '
+        .. 'end=/^\s*#\s*nb-error\s*:\s*end\s*$/ '
+        .. 'keepend containedin=ALL'
+    execute 'syntax region PythonNotebookStatus '
+        .. 'start=/^\s*#\s*nb-status\s*:\s*start.*$/ '
+        .. 'end=/^\s*#\s*nb-status\s*:\s*end\s*$/ '
+        .. 'keepend containedin=ALL'
+
+    EnsureNotebookHighlightGroups()
+    RefreshNotebookMatches()
+enddef
+
+def EnablePythonNotebookForBuffer(): bool
+    if exists('b:python_notebook_active')
+        return true
+    endif
+
+    b:python_notebook_active = 1
+    b:python_notebook_match_ids = []
+
+    SetupNotebookSyntax()
+
+    set nocursorline nocursorcolumn scrolloff=50
+
+    execute 'command! -buffer PythonNotebookRunAll call '
+        .. script_sid .. 'RunPythonNotebookFromScratch()'
+    execute 'command! -buffer PythonNotebookRunCell call '
+        .. script_sid .. 'RunPythonNotebookCurrentCell()'
+    execute 'command! -buffer PythonNotebookRestartKernel call '
+        .. script_sid .. 'RestartNotebookKernel()'
+    execute 'command! -buffer PythonNotebookClearOutputs call '
+        .. script_sid .. 'ClearNotebookOutputs()'
+    execute 'command! -buffer PythonNotebookDrawFigures call '
+        .. script_sid .. 'DrawNotebookFigures()'
+
+
+    execute 'augroup PythonNotebookBuffer_' .. bufnr('%')
+    autocmd! * <buffer>
+    execute 'autocmd BufWinEnter,WinEnter <buffer> call '
+        .. script_sid .. 'ScheduleNotebookFigureDraw()'
+    execute 'autocmd BufWinEnter <buffer> call '
+        .. script_sid .. 'FinishPendingNotebookKernelResponsesForCurrentBuffer()'
+    execute 'autocmd WinScrolled <buffer> call '
+        .. script_sid .. 'NotebookScrollRedraw()'
+    execute 'autocmd TextChanged,TextChangedI <buffer> call '
+        .. script_sid .. 'RefreshNotebookMatches()'
+    execute 'autocmd TextChanged,TextChangedI <buffer> call '
+        .. script_sid .. 'ScheduleNotebookFigureDraw()'
+    execute 'autocmd BufWinLeave,BufUnload <buffer> call '
+        .. script_sid .. 'NotebookWindowLeave()'
+    execute 'autocmd BufWinLeave,BufUnload <buffer> call '
+        .. script_sid .. 'ClearNotebookMatches()'
+    execute 'autocmd BufDelete,BufWipeout <buffer> call '
+        .. script_sid .. 'StopNotebookKernelForBuffer(str2nr(expand(''<abuf>'')))'
+    augroup END
+
+    echomsg 'notebook-python.vim: enabled for this buffer'
+    return true
+enddef
+
+def TryEnablePythonNotebook(noisy: bool = false): bool
+    if exists('b:python_notebook_active')
+        if noisy
+            echomsg 'notebook-python.vim: already enabled for this buffer'
+        endif
+        return true
+    endif
+
+    if !IsPythonBuffer()
+        if noisy
+            echohl WarningMsg
+            echomsg 'notebook-python.vim: current buffer is not a Python buffer'
+            echohl None
+        endif
+        return false
+    endif
+
+    if !HasNotebookAnnotation()
+        if noisy
+            echohl WarningMsg
+            echomsg 'notebook-python.vim: annotation not found near top of file'
+            echomsg 'notebook-python.vim: add: # notebook-python: enable'
+            echohl None
+        endif
+        return false
+    endif
+
+    return EnablePythonNotebookForBuffer()
+enddef
+
+def RunPythonNotebookCommand()
+    if !exists('b:python_notebook_active')
+        if !TryEnablePythonNotebook(true)
+            return
+        endif
+    endif
+
+    RunPythonNotebookFromScratch()
+enddef
+
+def RunPythonNotebookCellCommand()
+    if !exists('b:python_notebook_active')
+        if !TryEnablePythonNotebook(true)
+            return
+        endif
+    endif
+
+    RunPythonNotebookCurrentCell()
+enddef
+
+def RestartPythonNotebookKernelCommand()
+    if !exists('b:python_notebook_active')
+        if !TryEnablePythonNotebook(true)
+            return
+        endif
+    endif
+
+    RestartNotebookKernel()
+enddef
+
+def ClearPythonNotebookCommand()
+    if !exists('b:python_notebook_active')
+        if !TryEnablePythonNotebook(true)
+            return
+        endif
+    endif
+
+    ClearNotebookOutputs()
+    NotebookRedraw()
+enddef
+
+def QueryCellSize()
+    if exists('*echoraw')
+        echoraw("\<Esc>[16t")
+    else
+        try
+            writefile(["\<Esc>[16t"], '/dev/tty', 'b')
+        catch
+        endtry
+    endif
+enddef
+
+def HandleCellSizeResponse()
+    var h_str: string = ''
+    var w_str: string = ''
+    var c: string = getcharstr()
+    var iterations: number = 0
+
+    while c != ';' && c != 't' && c != "\<Esc>" && iterations < 10
+        h_str ..= c
+        c = getcharstr()
+        iterations += 1
+    endwhile
+
+    if c == ';'
+        c = getcharstr()
+        iterations = 0
+        while c != 't' && c != "\<Esc>" && iterations < 10
+            w_str ..= c
+            c = getcharstr()
+            iterations += 1
+        endwhile
+    endif
+
+    if !empty(h_str) && !empty(w_str)
+        var new_w: number = str2nr(w_str)
+        var new_h: number = str2nr(h_str)
+        if new_w > 0 && new_h > 0
+            g:python_notebook_cell_width = new_w
+            g:python_notebook_cell_height = new_h
+            ScheduleNotebookLayoutRedraw(1)
+        endif
+    endif
+enddef
+
+execute 'nnoremap <silent> <Esc>[6; :<C-u>call '
+        .. script_sid .. 'HandleCellSizeResponse()<CR>'
+execute 'vnoremap <silent> <Esc>[6; :<C-u>call '
+        .. script_sid .. 'HandleCellSizeResponse()<CR>'
+execute 'inoremap <silent> <Esc>[6; <Cmd>call '
+        .. script_sid .. 'HandleCellSizeResponse()<CR>'
+
+execute 'command! PythonNotebookTryEnable call '
+    .. script_sid .. 'TryEnablePythonNotebook(1)'
+execute 'command! PythonNotebookRunAll call '
+    .. script_sid .. 'RunPythonNotebookCommand()'
+execute 'command! PythonNotebookRunCell call '
+    .. script_sid .. 'RunPythonNotebookCellCommand()'
+execute 'command! PythonNotebookRestartKernel call '
+    .. script_sid .. 'RestartPythonNotebookKernelCommand()'
+execute 'command! PythonNotebookClearOutputs call '
+    .. script_sid .. 'ClearPythonNotebookCommand()'
+execute 'command! PythonNotebookStartUeberzugpp call '
+    .. script_sid .. 'StartUeberzugppLayerDaemon()'
+execute 'command! PythonNotebookStopUeberzugpp call '
+    .. script_sid .. 'StopUeberzugppLayerDaemon()'
+execute 'command! PythonNotebookStartImagePrepWorker call '
+    .. script_sid .. 'StartImagePrepWorker()'
+execute 'command! PythonNotebookStopImagePrepWorker call '
+    .. script_sid .. 'StopImagePrepWorker()'
+
+augroup PythonNotebookUeberzugpp
+    autocmd!
+    execute 'autocmd VimEnter * call '
+        .. script_sid .. 'QueryCellSize()'
+    execute 'autocmd VimEnter * call '
+        .. script_sid .. 'StartImagePrepWorker()'
+    execute 'autocmd VimEnter * call '
+        .. script_sid .. 'StartUeberzugppLayerDaemon()'
+    execute 'autocmd VimLeavePre * call '
+        .. script_sid .. 'StopAllNotebookKernels()'
+    execute 'autocmd VimLeavePre * call '
+        .. script_sid .. 'StopUeberzugppLayerDaemon()'
+augroup END
+
+augroup PythonNotebookWindowLayout
+    autocmd!
+    execute 'autocmd VimResized * call '
+        .. script_sid .. 'QueryCellSize()'
+    execute 'autocmd VimResized * call '
+        .. script_sid .. 'ScheduleNotebookLayoutRedraw(1)'
+    if exists('##WinResized')
+        execute 'autocmd WinResized * call '
+            .. script_sid .. 'ScheduleNotebookLayoutRedraw(1)'
+    endif
+    if exists('##WinNew')
+        execute 'autocmd WinNew * call '
+            .. script_sid .. 'ScheduleNotebookLayoutRedraw(1)'
+    endif
+    if exists('##WinClosed')
+        execute 'autocmd WinClosed * call '
+            .. script_sid .. 'ScheduleNotebookLayoutRedraw(1)'
+    endif
+    execute 'autocmd TabEnter * call '
+        .. script_sid .. 'ScheduleNotebookLayoutRedraw()'
+augroup END
+
+augroup PythonNotebookAutoEnable
+    autocmd!
+    execute 'autocmd FileType python call '
+        .. script_sid .. 'TryEnablePythonNotebook(0)'
+    execute 'autocmd BufEnter *.py call '
+        .. script_sid .. 'TryEnablePythonNotebook(0)'
+    execute 'autocmd BufReadPost *.py call '
+        .. script_sid .. 'TryEnablePythonNotebook(0)'
+augroup END
